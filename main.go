@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp" // Added for date regex
-	"sort"
 	"strconv"
 	"strings"
 	"time" // Added for time parsing and epoch conversion
@@ -37,6 +36,7 @@ var feedURLs = []string{
 	"https://nemweb.com.au/Reports/Current/FPPRUN/",
 	"https://nemweb.com.au/Reports/Current/PD7Day/",
 	"https://nemweb.com.au/Reports/Current/P5_Reports/",
+	// Add archive URLs here if needed
 }
 
 // --- Time Zone and Date Handling ---
@@ -82,7 +82,7 @@ func nemDateTimeToEpochMS(s string) (int64, error) {
 
 // --- Main Application Logic ---
 func main() {
-	inputDir := flag.String("input", "./input_csv", "Directory to download & extract latest CSVs into")
+	inputDir := flag.String("input", "./input_csv", "Directory to download & extract CSVs into")
 	outputDir := flag.String("output", "./output_parquet", "Directory to write Parquet files to")
 	dbPath := flag.String("db", ":memory:", "DuckDB database file path (use ':memory:' for in-memory)")
 	flag.Parse()
@@ -103,7 +103,8 @@ func main() {
 
 	// --- Download and Extract ---
 	log.Println("--- Downloading and Extracting CSVs ---")
-	if err := downloadAndExtractLatest(*inputDir); err != nil {
+	// *** Call the updated function ***
+	if err := downloadAndExtractFeedFiles(*inputDir); err != nil {
 		log.Printf("WARN: Download/extraction process encountered errors: %v", err)
 	}
 
@@ -271,7 +272,7 @@ func processCSVSections(csvPath, outDir string) error {
 				}
 			}
 
-			// --- Infer Schema and Initialize Writer (Modified for Date Detection) ---
+			// Infer Schema and Initialize Writer
 			if !schemaInferred {
 				peekedType, _ := scanner.PeekRecordType()
 				mustInferNow := hasBlanks && (peekedType != "D")
@@ -285,13 +286,11 @@ func processCSVSections(csvPath, outDir string) error {
 					currentMeta = make([]string, len(currentHeaders))
 					isDateColumn = make([]bool, len(currentHeaders)) // Initialize date tracking
 					for i := range currentHeaders {
-						var typ string   // Parquet type name
-						val := values[i] // Use the already trimmed value
-						isDate := false  // Flag for this column
-
-						// Date detection logic
-						if isNEMDateTime(val) { // Check the trimmed value
-							typ = "INT64" // Store epoch milliseconds as INT64
+						var typ string
+						val := values[i]
+						isDate := false
+						if isNEMDateTime(val) {
+							typ = "INT64"
 							isDate = true
 						} else if val == "" {
 							typ = "BYTE_ARRAY"
@@ -306,24 +305,18 @@ func processCSVSections(csvPath, outDir string) error {
 						} else {
 							typ = "BYTE_ARRAY"
 						}
-
-						isDateColumn[i] = isDate // Store if this column is a date
-
+						isDateColumn[i] = isDate
 						cleanHeader := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(currentHeaders[i], " ", "_"), ".", "_"), ";", "_")
 						if cleanHeader == "" {
 							cleanHeader = fmt.Sprintf("column_%d", i)
 						}
-
 						if typ == "BYTE_ARRAY" {
 							currentMeta[i] = fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", cleanHeader)
 						} else {
 							currentMeta[i] = fmt.Sprintf("name=%s, type=%s, repetitiontype=OPTIONAL", cleanHeader, typ)
 						}
-					} // End schema inference loop
-
+					}
 					log.Printf("     Inferred Schema for %s v%s: [%s]", currentComp, currentVer, strings.Join(currentMeta, "], ["))
-
-					// Create Parquet Writer
 					parquetFile := fmt.Sprintf("%s_%s_v%s.parquet", baseName, currentComp, currentVer)
 					path := filepath.Join(outDir, parquetFile)
 					var createErr error
@@ -349,20 +342,18 @@ func processCSVSections(csvPath, outDir string) error {
 					log.Printf("   Skipping schema inference on blank-containing row at line %d for %s v%s. Looking for cleaner row...", lineNumber, currentComp, currentVer)
 					continue
 				}
-			} // End writer initialization block (!schemaInferred)
+			}
 
-			// --- Write Data Row using WriteString (Modified for Date Conversion) ---
+			// Write Data Row
 			if !schemaInferred || pw == nil {
 				continue
 			}
-
 			recPtrs := make([]*string, len(values))
 			for j := 0; j < len(values); j++ {
 				isEmpty := values[j] == ""
-				finalValue := values[j] // Use the value already trimmed earlier
-
+				finalValue := values[j]
 				if isDateColumn[j] && !isEmpty {
-					epochMS, err := nemDateTimeToEpochMS(values[j]) // Pass the already trimmed value
+					epochMS, err := nemDateTimeToEpochMS(values[j])
 					if err != nil {
 						originalVal := "N/A"
 						if j < numDataCols {
@@ -374,7 +365,6 @@ func processCSVSections(csvPath, outDir string) error {
 					}
 					finalValue = strconv.FormatInt(epochMS, 10)
 				}
-
 				isTargetStringType := strings.Contains(currentMeta[j], "type=BYTE_ARRAY")
 				if isEmpty && !isTargetStringType {
 					recPtrs[j] = nil
@@ -383,7 +373,6 @@ func processCSVSections(csvPath, outDir string) error {
 					recPtrs[j] = &temp
 				}
 			}
-
 			if err := pw.WriteString(recPtrs); err != nil {
 				problematicData := "N/A"
 				schemaForProblem := "N/A"
@@ -441,8 +430,149 @@ func processCSVSections(csvPath, outDir string) error {
 	return nil
 }
 
+// --- File Download and Extraction (Modified to download ALL files) ---
+// Renamed from downloadAndExtractLatest
+func downloadAndExtractFeedFiles(dir string) error {
+	client := &http.Client{Timeout: 120 * time.Second}
+	var overallErr error
+	totalFilesExtractedCount := 0 // Track total across all feeds
+
+	for _, baseURL := range feedURLs {
+		log.Printf(" Checking feed: %s", baseURL)
+		resp, err := client.Get(baseURL)
+		if err != nil {
+			log.Printf("   WARN: Failed GET %s: %v. Skipping URL.", baseURL, err)
+			overallErr = errors.Join(overallErr, fmt.Errorf("GET %s: %w", baseURL, err))
+			continue
+		}
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			log.Printf("   WARN: Failed read body %s: %v. Skipping URL.", baseURL, readErr)
+			overallErr = errors.Join(overallErr, fmt.Errorf("read body %s: %w", baseURL, readErr))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("   WARN: Bad status '%s' for %s. Skipping URL.", resp.Status, baseURL)
+			overallErr = errors.Join(overallErr, fmt.Errorf("bad status %s for %s", resp.Status, baseURL))
+			continue
+		}
+		root, err := html.Parse(bytes.NewReader(bodyBytes))
+		if err != nil {
+			log.Printf("   WARN: Failed parse HTML %s: %v. Skipping URL.", baseURL, err)
+			overallErr = errors.Join(overallErr, fmt.Errorf("parse HTML %s: %w", baseURL, err))
+			continue
+		}
+		base, err := url.Parse(baseURL)
+		if err != nil {
+			log.Printf("   ERROR: Failed parse base URL %s: %v. Skipping URL.", baseURL, err)
+			overallErr = errors.Join(overallErr, fmt.Errorf("parse base URL %s: %w", baseURL, err))
+			continue
+		}
+
+		// Find ALL Links
+		links := parseLinks(root, ".zip")
+		if len(links) == 0 {
+			log.Printf("   INFO: No *.zip files found linked at %s", baseURL)
+			continue
+		}
+
+		log.Printf("   Found %d zip files at %s. Processing all...", len(links), baseURL)
+
+		// *** Loop through ALL found links ***
+		for _, relativeLink := range links {
+			// Resolve URL
+			zipURLAbs, err := base.Parse(relativeLink) // Handles relative/absolute links
+			if err != nil {
+				log.Printf("   WARN: Failed resolve ZIP URL '%s' relative to %s: %v. Skipping ZIP.", relativeLink, baseURL, err)
+				overallErr = errors.Join(overallErr, fmt.Errorf("resolve ZIP URL %s: %w", relativeLink, err))
+				continue
+			}
+			zipURL := zipURLAbs.String()
+			log.Printf("   Processing: %s", zipURL) // Changed log from "Found latest"
+
+			// --- Download File ---
+			log.Printf("     Downloading %s ...", zipURL)
+			data, err := downloadFile(client, zipURL)
+			if err != nil {
+				log.Printf("     WARN: Failed download %s: %v. Skipping ZIP.", zipURL, err)
+				overallErr = errors.Join(overallErr, fmt.Errorf("download %s: %w", zipURL, err))
+				continue
+			}
+			log.Printf("     Downloaded %d bytes.", len(data))
+
+			// --- Extract CSV from ZIP ---
+			zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				log.Printf("     WARN: Cannot open downloaded data from %s as ZIP: %v. Skipping ZIP.", zipURL, err)
+				overallErr = errors.Join(overallErr, fmt.Errorf("open zip %s: %w", zipURL, err))
+				continue
+			}
+
+			extractedFromThisZip := 0
+			for _, f := range zr.File {
+				if f.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(f.Name), ".csv") {
+					continue
+				}
+				cleanBaseName := filepath.Base(f.Name)
+				if cleanBaseName == "" || cleanBaseName == "." || cleanBaseName == ".." || strings.HasPrefix(cleanBaseName, ".") {
+					log.Printf("     WARN: Skipping potentially unsafe or hidden file in zip: %s", f.Name)
+					continue
+				}
+				outPath := filepath.Join(dir, cleanBaseName)
+
+				// Check if file already exists (optional: overwrite or skip?)
+				// Consider adding a flag to control overwrite behavior
+				if _, err := os.Stat(outPath); err == nil {
+					log.Printf("     INFO: Skipping extraction, file already exists: %s", outPath)
+					continue // Skip if file exists
+				}
+
+				in, err := f.Open()
+				if err != nil {
+					log.Printf("     ERROR: Failed open '%s' within zip: %v", f.Name, err)
+					overallErr = errors.Join(overallErr, fmt.Errorf("open zip entry %s: %w", f.Name, err))
+					continue
+				}
+				out, err := os.Create(outPath)
+				if err != nil {
+					in.Close()
+					log.Printf("     ERROR: Failed create output file %s: %v", outPath, err)
+					overallErr = errors.Join(overallErr, fmt.Errorf("create output %s: %w", outPath, err))
+					continue
+				}
+				copiedBytes, err := io.Copy(out, in)
+				in.Close()
+				out.Close()
+				if err != nil {
+					log.Printf("     ERROR: Failed copy data for '%s' to %s: %v", f.Name, outPath, err)
+					overallErr = errors.Join(overallErr, fmt.Errorf("copy %s: %w", f.Name, err))
+					os.Remove(outPath)
+					continue
+				}
+
+				log.Printf("       Extracted '%s' (%d bytes) to %s", f.Name, copiedBytes, outPath)
+				extractedFromThisZip++
+				totalFilesExtractedCount++ // Increment total counter
+			} // End loop zip entries
+
+			if extractedFromThisZip == 0 {
+				log.Printf("     INFO: No *.csv files found or extracted within %s", zipURL)
+			}
+
+		} // *** End loop through all links ***
+
+	} // End loop feedURLs
+
+	log.Printf(" Finished download/extract phase. Extracted %d CSV files total from all feeds.", totalFilesExtractedCount)
+	if totalFilesExtractedCount == 0 && overallErr == nil {
+		log.Println(" WARN: No CSV files were extracted from any source feeds.")
+	}
+
+	return overallErr
+}
+
 // --- DuckDB Parquet File Inspection ---
-// (inspectParquetFiles function remains the same)
 func inspectParquetFiles(parquetDir string, dbPath string) error {
 	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
@@ -536,12 +666,12 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 	}
 	log.Printf("DuckDB (Analysis): Parquet extension loaded.")
 
-	// --- Define Views (Reading INT64 for dates now) ---
+	// Define Views
 	createCfViewSQL := fmt.Sprintf(`CREATE OR REPLACE VIEW fpp_cf AS SELECT FPP_UNITID AS unit, INTERVAL_DATETIME, TRY_CAST(CONTRIBUTION_FACTOR AS DOUBLE) AS cf FROM read_parquet('%s/*CONTRIBUTION_FACTOR*.parquet', HIVE_PARTITIONING=0);`, parquetDir)
 	createRcrViewSQL := fmt.Sprintf(`CREATE OR REPLACE VIEW rcr AS SELECT INTERVAL_DATETIME, BIDTYPE AS SERVICE, TRY_CAST(RCR AS DOUBLE) AS rcr FROM read_parquet('%s/*FPP_RCR*.parquet', HIVE_PARTITIONING=0);`, parquetDir)
 	createPriceViewSQL := fmt.Sprintf(`CREATE OR REPLACE VIEW price AS SELECT INTERVAL_DATETIME, REGIONID, TRY_CAST(RAISEREGRRP AS DOUBLE) AS price_raisereg, TRY_CAST(LOWERREGRRP AS DOUBLE) AS price_lowerreg FROM read_parquet('%s/*PRICESOLUTION*.parquet', HIVE_PARTITIONING=0);`, parquetDir)
 
-	// --- Execute View Creation ---
+	// Execute View Creation
 	log.Printf("DuckDB (Analysis): Creating view fpp_cf...")
 	if _, err = conn.ExecContext(ctx, createCfViewSQL); err != nil {
 		return fmt.Errorf("failed to create view fpp_cf: %w", err)
@@ -556,8 +686,7 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 	}
 	log.Println("DuckDB (Analysis): Views created.")
 
-	// --- *** DIAGNOSTICS START *** ---
-	// 1. Check Distinct Service/BIDTYPE values
+	// Diagnostics: Check Distinct Service/BIDTYPE values
 	log.Println("DuckDB (Analysis): Checking distinct SERVICE values in rcr view...")
 	distinctServiceSQL := `SELECT DISTINCT SERVICE FROM rcr ORDER BY 1 NULLS LAST LIMIT 20;`
 	serviceRows, err := conn.QueryContext(ctx, distinctServiceSQL)
@@ -576,29 +705,16 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 		serviceRows.Close()
 	}
 
-	// 2. Check Date Range - Using corrected to_timestamp function
+	// Diagnostics: Check Date Range
 	log.Println("DuckDB (Analysis): Checking epoch date ranges (INT64)...")
-	// *** FIX: Use to_timestamp and divide by 1000 ***
 	epochCheckSQL := `
 	WITH epochs AS (
-		(SELECT 'fpp_cf' as tbl, INTERVAL_DATETIME FROM fpp_cf WHERE INTERVAL_DATETIME IS NOT NULL LIMIT 10000)
-		UNION ALL
-		(SELECT 'rcr' as tbl, INTERVAL_DATETIME FROM rcr WHERE INTERVAL_DATETIME IS NOT NULL LIMIT 10000)
-		UNION ALL
+		(SELECT 'fpp_cf' as tbl, INTERVAL_DATETIME FROM fpp_cf WHERE INTERVAL_DATETIME IS NOT NULL LIMIT 10000) UNION ALL
+		(SELECT 'rcr' as tbl, INTERVAL_DATETIME FROM rcr WHERE INTERVAL_DATETIME IS NOT NULL LIMIT 10000) UNION ALL
 		(SELECT 'price' as tbl, INTERVAL_DATETIME FROM price WHERE INTERVAL_DATETIME IS NOT NULL LIMIT 10000)
-	)
-	SELECT
-		tbl,
-		COUNT(*) as sample_count,
-		MIN(INTERVAL_DATETIME) as min_epoch_ms,
-		MAX(INTERVAL_DATETIME) as max_epoch_ms,
-		-- Convert min/max epoch back to timestamp string for readability (using DuckDB function)
-		-- Divide by 1000 to convert ms to seconds for to_timestamp
-		to_timestamp(MIN(INTERVAL_DATETIME) / 1000) as min_epoch_ts,
-		to_timestamp(MAX(INTERVAL_DATETIME) / 1000) as max_epoch_ts
-	FROM epochs
-	GROUP BY tbl;
-	`
+	) SELECT tbl, COUNT(*) as sample_count, MIN(INTERVAL_DATETIME) as min_epoch_ms, MAX(INTERVAL_DATETIME) as max_epoch_ms,
+		to_timestamp(MIN(INTERVAL_DATETIME) / 1000) as min_epoch_ts, to_timestamp(MAX(INTERVAL_DATETIME) / 1000) as max_epoch_ts
+	FROM epochs GROUP BY tbl;`
 	epochRows, err := conn.QueryContext(ctx, epochCheckSQL)
 	if err != nil {
 		log.Printf("WARN: Failed to query epoch date ranges: %v", err)
@@ -610,7 +726,7 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 			var tbl sql.NullString
 			var sCnt sql.NullInt64
 			var minE, maxE sql.NullInt64
-			var minTs, maxTs sql.NullString // Timestamps as strings
+			var minTs, maxTs sql.NullString
 			if err := epochRows.Scan(&tbl, &sCnt, &minE, &maxE, &minTs, &maxTs); err != nil {
 				log.Printf("  WARN: Error scanning epoch range row: %v", err)
 				break
@@ -619,9 +735,8 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 		}
 		epochRows.Close()
 	}
-	// --- *** DIAGNOSTICS END *** ---
 
-	// --- Calculate Combined FPP View (Joins on INT64 now) ---
+	// Calculate Combined FPP View
 	calculateFppSQL := `
 	CREATE OR REPLACE VIEW fpp_combined AS
 	SELECT cf.unit, cf.INTERVAL_DATETIME, cf.cf, r.rcr, r.SERVICE,
@@ -635,7 +750,7 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 	}
 	log.Println("DuckDB (Analysis): Combined FPP view created.")
 
-	// --- *** DIAGNOSTICS CONTINUED *** ---
+	// Diagnostics: Check Join Count
 	checkJoinSQL := `SELECT COUNT(*) FROM fpp_combined;`
 	var joinRowCount int64 = -1
 	err = conn.QueryRowContext(ctx, checkJoinSQL).Scan(&joinRowCount)
@@ -647,16 +762,15 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 			log.Printf(">>> WARNING: Joins/SERVICE filter produced 0 rows BEFORE date filtering. Check data overlap/SERVICE values. <<<")
 		}
 	}
-	// --- *** DIAGNOSTICS END *** ---
 
-	// --- Calculate Epoch Milliseconds for Date Range Filter ---
+	// Calculate Epoch Milliseconds for Date Range Filter
 	startFilterTime, _ := time.ParseInLocation("2006/01/02 15:04:05", "2025/04/01 00:00:00", nemLocation)
 	endFilterTime, _ := time.ParseInLocation("2006/01/02 15:04:05", "2025/04/30 23:59:59", nemLocation)
 	startEpochMS := startFilterTime.UnixMilli()
 	endEpochMS := endFilterTime.UnixMilli()
 	log.Printf("DuckDB (Analysis): Filtering between Epoch MS: %d (%s) and %d (%s)", startEpochMS, startFilterTime.Format(time.RFC3339), endEpochMS, endFilterTime.Format(time.RFC3339))
 
-	// --- Aggregate FPP over billing period (Using Epoch MS Filter) ---
+	// Aggregate FPP over billing period
 	aggregateFppSQL := fmt.Sprintf(`
 	SELECT unit, SUM(CASE WHEN UPPER(SERVICE) = 'RAISEREG' THEN fpp_cost ELSE 0 END) AS total_raise_fpp, SUM(CASE WHEN UPPER(SERVICE) = 'LOWERREG' THEN fpp_cost ELSE 0 END) AS total_lower_fpp, SUM(fpp_cost) AS total_fpp
 	FROM fpp_combined WHERE INTERVAL_DATETIME BETWEEN %d AND %d GROUP BY unit ORDER BY unit;`, startEpochMS, endEpochMS)
@@ -699,121 +813,6 @@ func runDuckDBAnalysis(ctx context.Context, parquetDir string, dbPath string) er
 	}
 	log.Println(strings.Repeat("-", 85))
 	return nil
-}
-
-// --- File Download and Extraction ---
-// (downloadAndExtractLatest function remains the same)
-func downloadAndExtractLatest(dir string) error {
-	client := &http.Client{Timeout: 120 * time.Second}
-	var overallErr error
-	filesExtractedCount := 0
-	for _, baseURL := range feedURLs {
-		log.Printf(" Checking feed: %s", baseURL)
-		resp, err := client.Get(baseURL)
-		if err != nil {
-			log.Printf("   WARN: Failed GET %s: %v. Skipping URL.", baseURL, err)
-			overallErr = errors.Join(overallErr, fmt.Errorf("GET %s: %w", baseURL, err))
-			continue
-		}
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			log.Printf("   WARN: Failed read body %s: %v. Skipping URL.", baseURL, readErr)
-			overallErr = errors.Join(overallErr, fmt.Errorf("read body %s: %w", baseURL, readErr))
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("   WARN: Bad status '%s' for %s. Skipping URL.", resp.Status, baseURL)
-			overallErr = errors.Join(overallErr, fmt.Errorf("bad status %s for %s", resp.Status, baseURL))
-			continue
-		}
-		root, err := html.Parse(bytes.NewReader(bodyBytes))
-		if err != nil {
-			log.Printf("   WARN: Failed parse HTML %s: %v. Skipping URL.", baseURL, err)
-			overallErr = errors.Join(overallErr, fmt.Errorf("parse HTML %s: %w", baseURL, err))
-			continue
-		}
-		base, err := url.Parse(baseURL)
-		if err != nil {
-			log.Printf("   ERROR: Failed parse base URL %s: %v. Skipping URL.", baseURL, err)
-			overallErr = errors.Join(overallErr, fmt.Errorf("parse base URL %s: %w", baseURL, err))
-			continue
-		}
-		links := parseLinks(root, ".zip")
-		if len(links) == 0 {
-			log.Printf("   INFO: No *.zip files found linked at %s", baseURL)
-			continue
-		}
-		sort.Strings(links)
-		latestRelative := links[len(links)-1]
-		latestURL, err := base.Parse(latestRelative)
-		if err != nil {
-			log.Printf("   WARN: Failed resolve ZIP URL '%s' relative to %s: %v. Skipping ZIP.", latestRelative, baseURL, err)
-			overallErr = errors.Join(overallErr, fmt.Errorf("resolve ZIP URL %s: %w", latestRelative, err))
-			continue
-		}
-		zipURL := latestURL.String()
-		log.Printf("   Found latest: %s", zipURL)
-		log.Printf("   Downloading %s ...", zipURL)
-		data, err := downloadFile(client, zipURL)
-		if err != nil {
-			log.Printf("   WARN: Failed download %s: %v. Skipping ZIP.", zipURL, err)
-			overallErr = errors.Join(overallErr, fmt.Errorf("download %s: %w", zipURL, err))
-			continue
-		}
-		log.Printf("   Downloaded %d bytes.", len(data))
-		zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-		if err != nil {
-			log.Printf("   WARN: Cannot open downloaded data from %s as ZIP: %v. Skipping ZIP.", zipURL, err)
-			overallErr = errors.Join(overallErr, fmt.Errorf("open zip %s: %w", zipURL, err))
-			continue
-		}
-		extractedFromThisZip := 0
-		for _, f := range zr.File {
-			if f.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(f.Name), ".csv") {
-				continue
-			}
-			cleanBaseName := filepath.Base(f.Name)
-			if cleanBaseName == "" || cleanBaseName == "." || cleanBaseName == ".." || strings.HasPrefix(cleanBaseName, ".") {
-				log.Printf("   WARN: Skipping potentially unsafe or hidden file in zip: %s", f.Name)
-				continue
-			}
-			outPath := filepath.Join(dir, cleanBaseName)
-			in, err := f.Open()
-			if err != nil {
-				log.Printf("   ERROR: Failed open '%s' within zip: %v", f.Name, err)
-				overallErr = errors.Join(overallErr, fmt.Errorf("open zip entry %s: %w", f.Name, err))
-				continue
-			}
-			out, err := os.Create(outPath)
-			if err != nil {
-				in.Close()
-				log.Printf("   ERROR: Failed create output file %s: %v", outPath, err)
-				overallErr = errors.Join(overallErr, fmt.Errorf("create output %s: %w", outPath, err))
-				continue
-			}
-			copiedBytes, err := io.Copy(out, in)
-			in.Close()
-			out.Close()
-			if err != nil {
-				log.Printf("   ERROR: Failed copy data for '%s' to %s: %v", f.Name, outPath, err)
-				overallErr = errors.Join(overallErr, fmt.Errorf("copy %s: %w", f.Name, err))
-				os.Remove(outPath)
-				continue
-			}
-			log.Printf("     Extracted '%s' (%d bytes) to %s", f.Name, copiedBytes, outPath)
-			extractedFromThisZip++
-			filesExtractedCount++
-		}
-		if extractedFromThisZip == 0 {
-			log.Printf("   INFO: No *.csv files found or extracted within %s", zipURL)
-		}
-	}
-	log.Printf(" Finished download/extract phase. Extracted %d CSV files total.", filesExtractedCount)
-	if filesExtractedCount == 0 && overallErr == nil {
-		log.Println(" WARN: No CSV files were extracted from any source feeds.")
-	}
-	return overallErr
 }
 
 // --- Utility Functions ---
