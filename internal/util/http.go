@@ -97,7 +97,6 @@ func DefaultHTTPClient() *http.Client {
 }
 
 // --- Old DownloadFile (kept for reference or if needed elsewhere without progress) ---
-/*
 func DownloadFile(client *http.Client, req *http.Request) ([]byte, error) {
 	resp, err := client.Do(req)
 	if err != nil {
@@ -117,4 +116,3 @@ func DownloadFile(client *http.Client, req *http.Request) ([]byte, error) {
 	}
 	return bodyBytes, nil
 }
-*/
