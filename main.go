@@ -211,28 +211,22 @@ func main() {
 	// --- Run DuckDB FPP Analysis ---
 	// This step runs after all processing is complete.
 	// Only run if there were no *processing* errors and some files were processed or skipped.
-	mu.Lock() // Lock to safely read errorCount and processedCount/skippedCount
-	canRunAnalysis := errorCount == 0 && (processedCount > 0 || skippedCount > 0)
-	mu.Unlock()
+	// mu.Lock() // Lock to safely read errorCount and processedCount/skippedCount
+	// canRunAnalysis := errorCount == 0 && (processedCount > 0 || skippedCount > 0)
+	// mu.Unlock()
 
-	if canRunAnalysis {
-		log.Println("--- Running DuckDB FPP Analysis ---")
-		absOutputDir, err := filepath.Abs(*outputDir)
-		if err != nil {
-			log.Printf("ERROR getting absolute path for output directory %s: %v", *outputDir, err)
-			log.Println("Skipping DuckDB Analysis.")
+	log.Println("--- Running DuckDB FPP Analysis ---")
+	absOutputDir, err := filepath.Abs(*outputDir)
+	if err != nil {
+		log.Printf("ERROR getting absolute path for output directory %s: %v", *outputDir, err)
+		log.Println("Skipping DuckDB Analysis.")
+	} else {
+		analysisCtx := context.Background()
+		if err := runDuckDBAnalysis(analysisCtx, absOutputDir, *dbPath); err != nil {
+			log.Printf("ERROR running DuckDB analysis: %v", err)
 		} else {
-			analysisCtx := context.Background()
-			if err := runDuckDBAnalysis(analysisCtx, absOutputDir, *dbPath); err != nil {
-				log.Printf("ERROR running DuckDB analysis: %v", err)
-			} else {
-				log.Println("DuckDB FPP Analysis finished successfully.")
-			}
+			log.Println("DuckDB FPP Analysis finished successfully.")
 		}
-	} else if processedCount == 0 && skippedCount == 0 {
-		log.Println("Skipping DuckDB Analysis: No relevant Parquet files found or generated.")
-	} else { // errorCount > 0
-		log.Println("Skipping DuckDB Analysis due to CSV processing errors.")
 	}
 
 	log.Println("NEM Parquet Converter finished.")
