@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Use your actual module path
@@ -23,6 +24,8 @@ import (
 	"github.com/brensch/nemparquet/internal/downloader"
 	"github.com/brensch/nemparquet/internal/processor"
 	"github.com/brensch/nemparquet/internal/util"
+
+	"golang.org/x/sync/semaphore" // Import semaphore for inner extraction
 )
 
 // RunCombinedWorkflow orchestrates the download and process sequence.
@@ -58,15 +61,14 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 			err := value.(error)
 			logger.Warn("Processor worker error recorded", slog.String("path", path), slog.Any("error", err))
 			// Join processor errors into finalErr *after* main logic returns
-			finalErr = errors.Join(finalErr, fmt.Errorf("process %s: %w", filepath.Base(path), err))
+			// For now, just log them here.
 			processorErrorCount++
 			return true
 		})
 		if processorErrorCount > 0 {
 			logger.Warn("Processing phase completed with errors.", slog.Int("error_count", processorErrorCount))
 		}
-		// Avoid double logging success if only processor errors occurred
-		// else if finalErr == nil { logger.Info("Processing phase completed successfully.") }
+		// Final success log depends on finalErr state after this defer potentially modifies it
 	}() // End defer
 
 	// --- Phase 2: Discover All Potential Zip URLs ---
@@ -80,7 +82,8 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 	}
 	if ctx.Err() != nil {
 		return errors.Join(finalErr, ctx.Err())
-	}
+	} // Check context after discovery
+
 	allDiscoveredURLs := make([]string, 0, len(currentURLsMap)+len(archiveURLsMap))
 	urlToSourceMap := make(map[string]string)
 	urlIsArchive := make(map[string]bool)
@@ -173,13 +176,15 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 	downloadErrorCount := 0
 	skippedDownloadCount := 0
 
+downloadLoop: // Label for breaking outer loop on context cancellation
 	for _, currentURL := range allDiscoveredURLs {
 		select {
 		case <-ctx.Done():
 			logger.Warn("Workflow cancelled during download/extract loop.")
-			return errors.Join(finalErr, ctx.Err())
+			finalErr = errors.Join(finalErr, ctx.Err())
+			break downloadLoop
 		default:
-		}
+		} // Break outer loop
 		processedURLCount++
 		isOuterArchive := urlIsArchive[currentURL]
 		fileTypeForLog := db.FileTypeZip
@@ -209,7 +214,8 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 					select {
 					case processingJobsChan <- absPath:
 					case <-ctx.Done():
-						return errors.Join(finalErr, ctx.Err())
+						finalErr = errors.Join(finalErr, ctx.Err())
+						break downloadLoop
 					}
 				} else {
 					l.Warn("Skipped download file missing locally, cannot queue.", "path", absPath, "error", statErr)
@@ -236,9 +242,9 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 		req.Header.Set("Accept", "*/*")
 		var downloadedData []byte
 		var downloadErr error
-		if isOuterArchive { // Use streaming download for outer archives
+		if isOuterArchive {
 			l.Debug("Using streaming download for outer archive.")
-			progressCallback := func(dlBytes int64, totalBytes int64) { /* ... logging callback ... */
+			progressCallback := func(dlBytes int64, totalBytes int64) {
 				if totalBytes > 0 {
 					l.Info("Download progress", slog.Int64("dl_mb", dlBytes/(1<<20)), slog.Int64("tot_mb", totalBytes/(1<<20)), slog.Float64("pct", float64(dlBytes)*100.0/float64(totalBytes)))
 				} else {
@@ -246,7 +252,7 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 				}
 			}
 			downloadedData, downloadErr = util.DownloadFileWithProgress(client, req, progressCallback)
-		} else { // Use standard download for regular zips
+		} else {
 			downloadedData, downloadErr = util.DownloadFile(client, req)
 		}
 		downloadDuration := time.Since(startTime)
@@ -263,19 +269,22 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 		// Handle downloaded data
 		if isOuterArchive {
 			l.Info("Processing inner files within outer archive.")
-			// ** Pass processingJobsChan to processInnerArchiveFiles **
 			extractErr := processInnerArchiveFiles(ctx, cfg, dbConn, l, currentURL, downloadedData, forceDownload, processingJobsChan) // Pass channel
 			processDuration := time.Since(startTime)
 			if extractErr != nil {
+				if errors.Is(extractErr, context.Canceled) || errors.Is(extractErr, context.DeadlineExceeded) {
+					l.Warn("Inner archive processing cancelled.")
+					finalErr = errors.Join(finalErr, extractErr)
+					break downloadLoop
+				} // Break outer loop
 				l.Error("Errors processing inner files.", "error", extractErr)
 				db.LogFileEvent(ctx, dbConn, currentURL, db.FileTypeOuterArchive, db.EventError, "", "", fmt.Sprintf("inner processing error: %v", extractErr), "", &processDuration)
 				finalErr = errors.Join(finalErr, extractErr)
 			} else {
 				l.Info("Successfully processed inner files (extracted/queued).")
 				db.LogFileEvent(ctx, dbConn, currentURL, db.FileTypeOuterArchive, db.EventProcessEnd, "", "", "Inner files extracted/queued", "", &processDuration)
-			} // Log outer archive process end here
+			}
 		} else {
-			// Save regular zip and queue its path
 			zipFilename := filepath.Base(currentURL)
 			outputZipPath := filepath.Join(cfg.InputDir, zipFilename)
 			absOutputZipPath, absErr := filepath.Abs(outputZipPath)
@@ -296,7 +305,6 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 				downloadErrorCount++
 				continue
 			}
-			// Log save event (replaces download_end path logging)
 			db.LogFileEvent(ctx, dbConn, currentURL, db.FileTypeZip, "save_end", urlToSourceMap[currentURL], absOutputZipPath, "", "", &saveDuration)
 			l.Info("Successfully saved zip.", slog.String("path", absOutputZipPath))
 			select {
@@ -304,16 +312,18 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 				l.Debug("Sent path to processor channel.", slog.String("path", absOutputZipPath))
 			case <-ctx.Done():
 				logger.Warn("Cancelled while sending downloaded path.")
-				return errors.Join(finalErr, ctx.Err())
-			}
+				finalErr = errors.Join(finalErr, ctx.Err())
+				break downloadLoop
+			} // Break outer loop
 		}
 	} // End download loop
 
 	// --- Phase 6: Shutdown and Wait ---
-	logger.Info("Phase 6: All download/queueing phases complete.")
+	logger.Info("Phase 6: Download/queueing loop finished.")
 	// The defer function handles closing the channel and waiting for workers.
 
 	// Consolidate final errors *after* defer runs
+	// Need to capture processor errors from the map *before* returning finalErr
 	processorErrorCount := 0
 	processorErrors.Range(func(key, value interface{}) bool {
 		path := key.(string)
@@ -323,23 +333,21 @@ func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB,
 		return true
 	})
 	if processorErrorCount > 0 {
-		logger.Warn("Processing finished with errors.", slog.Int("error_count", processorErrorCount))
+		logger.Warn("Processing completed with errors.", slog.Int("error_count", processorErrorCount))
 	} else if finalErr == nil {
-		logger.Info("Processing finished successfully.")
+		logger.Info("Processing completed successfully.")
 	}
 
 	logger.Info("Combined workflow finished.")
 	return finalErr // Return final accumulated error state
 }
 
-// ** MODIFIED ** processInnerArchiveFiles handles extracting, saving, and queueing needed inner zip files.
-// It no longer logs individual inner file download events, only errors.
-// Returns an aggregated error.
+// processInnerArchiveFiles handles extracting, saving, and queueing needed inner zip files concurrently.
 func processInnerArchiveFiles(
 	ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger,
 	outerArchiveURL string, outerZipData []byte, forceDownload bool,
-	processingJobsChan chan<- string, // Channel to send paths to
-) error { // Return only error now
+	processingJobsChan chan<- string,
+) error { // Return only aggregated error
 
 	l := logger.With(slog.String("outer_archive_url", outerArchiveURL))
 	l.Debug("Opening outer archive from memory.")
@@ -370,110 +378,162 @@ func processInnerArchiveFiles(
 	l.Info("Found inner zip files.", slog.Int("count", len(innerZipFiles)))
 
 	l.Debug("Checking DB status for inner zip files...")
-	// Check if inner files were previously *downloaded* (saved)
 	innerDownloadedMap, dbErr := db.GetCompletionStatusBatch(ctx, dbConn, innerZipIdentifiers, db.FileTypeZip, db.EventDownloadEnd)
 	if dbErr != nil {
-		l.Error("DB error checking inner zip download status, extracting all.", "error", dbErr)
+		l.Error("DB error checking inner status, proceeding cautiously.", "error", dbErr)
 		innerDownloadedMap = make(map[string]bool)
-	} // Proceed cautiously, log error
+	} // Log error, proceed
 
-	var innerErrors error
-	extractedCount := 0
-	skippedCount := 0
-	queuedCount := 0
+	var innerErrors sync.Map // Use sync.Map for concurrent error storage
+	var extractedCount atomic.Int32
+	var skippedCount atomic.Int32
+	var queuedCount atomic.Int32
+	var innerWg sync.WaitGroup
+	concurrencyLimit := int64(cfg.NumWorkers / 2)
+	if concurrencyLimit < 1 {
+		concurrencyLimit = 1
+	}
+	if concurrencyLimit > 8 {
+		concurrencyLimit = 8
+	}
+	innerSem := semaphore.NewWeighted(concurrencyLimit)
+	l.Debug("Starting concurrent extraction/save.", slog.Int64("concurrency", concurrencyLimit))
 
-	for _, f := range innerZipFiles {
+	innerLoopCtx, cancelInnerLoop := context.WithCancel(ctx) // Context to cancel inner goroutines early
+	defer cancelInnerLoop()                                  // Ensure cancellation signal propagates if outer context isn't cancelled first
+
+	for _, fPtr := range innerZipFiles {
+		f := fPtr // Capture loop variable
+
+		// Check context before potentially blocking on semaphore or dispatching
 		select {
-		case <-ctx.Done():
-			l.Warn("Cancelled inner extraction.")
-			return errors.Join(innerErrors, ctx.Err())
+		case <-innerLoopCtx.Done():
+			l.Warn("Cancelled before processing next inner file.")
+			break
 		default:
-		}
+		} // Break loop if cancelled
+
 		innerZipName := filepath.Base(f.Name)
 		innerLogger := l.With(slog.String("inner_zip", innerZipName))
 		outputZipPath := filepath.Join(cfg.InputDir, innerZipName)
 		absOutputZipPath, absErr := filepath.Abs(outputZipPath)
 		if absErr != nil {
 			innerLogger.Error("Cannot get absolute path, skipping inner zip.", "error", absErr)
-			innerErrors = errors.Join(innerErrors, absErr)
+			innerErrors.Store(innerZipName, absErr)
 			continue
 		}
 
 		// Check if inner zip download needs to be skipped
 		if _, completed := innerDownloadedMap[innerZipName]; completed && !forceDownload {
 			innerLogger.Debug("Skipping inner zip extraction, already downloaded.")
-			skippedCount++
-			// ** REMOVED individual skip log **
-			// Queue for processing check if file exists locally
+			skippedCount.Add(1)
 			if _, statErr := os.Stat(absOutputZipPath); statErr == nil {
-				innerLogger.Info("Queueing previously downloaded inner zip for processing check.", slog.String("path", absOutputZipPath))
+				innerLogger.Info("Queueing previously downloaded inner zip.", slog.String("path", absOutputZipPath))
 				select {
 				case processingJobsChan <- absOutputZipPath:
-					queuedCount++
-				case <-ctx.Done():
-					return errors.Join(innerErrors, ctx.Err())
-				}
+					queuedCount.Add(1)
+				case <-innerLoopCtx.Done():
+					break
+				} // Break loop if cancelled
 			} else {
 				innerLogger.Warn("Skipped inner zip missing locally, cannot queue.", "path", absOutputZipPath, "error", statErr)
 			}
 			continue
 		}
 
-		// --- Extract and Save inner zip ---
-		innerLogger.Info("Extracting and saving inner zip.")
-		extractStartTime := time.Now()
-		// ** REMOVED download_start log for inner zip **
-		rc, err := f.Open()
-		if err != nil { /* ... handle open error ... */
-			extractErr := fmt.Errorf("open inner %s: %w", innerZipName, err)
-			innerLogger.Error("Failed open inner stream.", "error", extractErr)
-			innerErrors = errors.Join(innerErrors, extractErr)
-			continue
-		} // Log only error
-		outFile, err := os.Create(outputZipPath)
-		if err != nil { /* ... handle create error ... */
-			rc.Close()
-			extractErr := fmt.Errorf("create file %s: %w", outputZipPath, err)
-			innerLogger.Error("Failed create output file.", "error", extractErr)
-			innerErrors = errors.Join(innerErrors, extractErr)
-			continue
-		}
-		_, err = io.Copy(outFile, rc)
-		rc.Close()
-		closeErr := outFile.Close()
-		extractDuration := time.Since(extractStartTime)
-		if err != nil { /* ... handle copy error ... */
-			extractErr := fmt.Errorf("copy inner %s: %w", innerZipName, err)
-			innerLogger.Error("Failed copy inner zip.", "error", extractErr)
-			os.Remove(outputZipPath)
-			innerErrors = errors.Join(innerErrors, extractErr)
-			continue
-		}
-		if closeErr != nil {
-			innerLogger.Warn("Error closing output file.", "error", closeErr)
-			innerErrors = errors.Join(innerErrors, fmt.Errorf("close %s: %w", outputZipPath, closeErr))
-		}
+		// Acquire semaphore
+		if err := innerSem.Acquire(innerLoopCtx, 1); err != nil {
+			innerLogger.Error("Failed acquire semaphore (context cancelled?)", "error", err)
+			innerErrors.Store(innerZipName, err)
+			break
+		} // Break loop
 
-		innerLogger.Debug("Inner zip extracted.", slog.Duration("duration", extractDuration.Round(time.Millisecond)))
-		extractedCount++
-		// ** LOG download_end for inner zip name HERE, associating with outer archive **
-		db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventDownloadEnd, outerArchiveURL, absOutputZipPath, "", "", &extractDuration)
+		// Launch goroutine
+		innerWg.Add(1)
+		go func(file *zip.File, log *slog.Logger, outPathAbs string) {
+			defer innerWg.Done()
+			defer innerSem.Release(1)
+			// Check context at start of goroutine too
+			if innerLoopCtx.Err() != nil {
+				return
+			}
 
-		// Queue the newly saved path for processing
-		select {
-		case processingJobsChan <- absOutputZipPath:
-			innerLogger.Debug("Sent extracted path to processor channel.", slog.String("path", absOutputZipPath))
-			queuedCount++
-		case <-ctx.Done():
-			logger.Warn("Cancelled while sending extracted path.")
-			innerErrors = errors.Join(innerErrors, ctx.Err())
-			return errors.Join(innerErrors, ctx.Err())
-		}
-	} // End loop inner zips
+			log.Info("Extracting and saving inner zip.")
+			extractStartTime := time.Now()
+			db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventDownloadStart, outerArchiveURL, outPathAbs, "", "", nil)
+			rc, err := file.Open()
+			if err != nil {
+				extractErr := fmt.Errorf("open inner %s: %w", innerZipName, err)
+				log.Error("Failed open inner stream.", "error", extractErr)
+				innerErrors.Store(innerZipName, extractErr)
+				db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventError, outerArchiveURL, outPathAbs, extractErr.Error(), "", nil)
+				return
+			}
+			defer rc.Close()
+			outFile, err := os.Create(outPathAbs)
+			if err != nil {
+				extractErr := fmt.Errorf("create file %s: %w", outPathAbs, err)
+				log.Error("Failed create output file.", "error", extractErr)
+				innerErrors.Store(innerZipName, extractErr)
+				db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventError, outerArchiveURL, outPathAbs, extractErr.Error(), "", nil)
+				return
+			}
+			defer func() {
+				if cerr := outFile.Close(); cerr != nil {
+					log.Warn("Error closing output file.", "error", cerr)
+					innerErrors.Store(innerZipName+"_close", cerr)
+				}
+			}()
+			_, err = io.Copy(outFile, rc)
+			extractDuration := time.Since(extractStartTime)
+			if err != nil {
+				extractErr := fmt.Errorf("copy inner %s: %w", innerZipName, err)
+				log.Error("Failed copy inner zip.", "error", extractErr)
+				os.Remove(outPathAbs)
+				innerErrors.Store(innerZipName, extractErr)
+				db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventError, outerArchiveURL, outPathAbs, extractErr.Error(), "", &extractDuration)
+				return
+			}
 
-	// Log summary for the outer archive's inner file processing phase
-	l.Info("Finished processing inner files.", slog.Int("extracted", extractedCount), slog.Int("skipped", skippedCount), slog.Int("queued_for_processing", queuedCount), slog.Int("errors", errorCount(innerErrors)))
-	return innerErrors // Return only errors encountered during this stage
+			log.Debug("Inner zip extracted.", slog.Duration("duration", extractDuration.Round(time.Millisecond)))
+			extractedCount.Add(1)
+			db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventDownloadEnd, outerArchiveURL, outPathAbs, "", "", &extractDuration)
+
+			select {
+			case processingJobsChan <- outPathAbs:
+				log.Debug("Sent extracted path to processor channel.", slog.String("path", outPathAbs))
+				queuedCount.Add(1)
+			case <-innerLoopCtx.Done():
+				logger.Warn("Cancelled while sending extracted path.")
+				innerErrors.Store(innerZipName+"_queue_cancel", innerLoopCtx.Err())
+			}
+		}(f, innerLogger, absOutputZipPath)
+
+	} // End loop dispatching inner zips
+
+	// Wait for all extraction goroutines for *this specific outer archive* to complete
+	innerWg.Wait()
+	l.Info("Finished processing inner files.", slog.Int("extracted", int(extractedCount.Load())), slog.Int("skipped", int(skippedCount.Load())), slog.Int("queued_for_processing", int(queuedCount.Load())))
+
+	// Consolidate errors from the sync.Map for *this archive*
+	var aggregatedInnerError error
+	innerErrors.Range(func(key, value interface{}) bool {
+		filename := key.(string)
+		err := value.(error)
+		aggregatedInnerError = errors.Join(aggregatedInnerError, fmt.Errorf("%s: %w", filename, err))
+		return true
+	})
+
+	// Log a single summary event for the outer archive's extraction phase
+	finalMessage := fmt.Sprintf("Inner file processing summary: Extracted=%d, Skipped=%d, Queued=%d", extractedCount.Load(), skippedCount.Load(), queuedCount.Load())
+	if aggregatedInnerError != nil {
+		finalMessage += fmt.Sprintf(", Errors Encountered: %v", aggregatedInnerError)
+		db.LogFileEvent(ctx, dbConn, outerArchiveURL, db.FileTypeOuterArchive, db.EventError, "", "", finalMessage, "", nil)
+	} else { /* Log outer archive process end event only if NO inner errors? Or log it anyway? Let's log it anyway to signify this phase finished. */
+		db.LogFileEvent(ctx, dbConn, outerArchiveURL, db.FileTypeOuterArchive, db.EventProcessEnd, "", "", finalMessage, "", nil)
+	} // Log outer archive process end here
+
+	return aggregatedInnerError // Return aggregated errors from this archive's inner processing
 }
 
 // errorCount helper
