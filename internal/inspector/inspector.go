@@ -5,43 +5,51 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"strings"
+	"time" // Import time for context timeout
 
-	"github.com/brensch/nemparquet/internal/config" // Use your module name
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/config"
 
 	_ "github.com/marcboeker/go-duckdb"
 )
 
-// InspectParquet connects to DuckDB and inspects parquet files.
-func InspectParquet(cfg config.Config) error {
-	log.Println("--- Starting Parquet File Inspection ---")
-	db, err := sql.Open("duckdb", cfg.DbPath) // Use path from config
+// InspectParquet connects to DuckDB and inspects parquet files, using slog.
+func InspectParquet(cfg config.Config, logger *slog.Logger) error {
+	logger.Info("--- Starting Parquet File Inspection ---")
+
+	// Use the configured DB path for potential temporary operations if needed,
+	// or connect to :memory: if inspection should be isolated.
+	// Using cfg.DbPath allows inspection even if main DB is :memory:
+	// but might interfere if state DB is persistent and inspection does writes (it shouldn't).
+	// Let's use cfg.DbPath for consistency.
+	db, err := sql.Open("duckdb", cfg.DbPath)
 	if err != nil {
 		return fmt.Errorf("failed to open duckdb database (%s): %w", cfg.DbPath, err)
 	}
 	defer db.Close()
 
-	conn, err := db.Conn(context.Background()) // Use background context for inspection
+	// Use a background context with timeout for DB operations
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // Example timeout
+	defer cancel()
+
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get connection from pool: %w", err)
 	}
 	defer conn.Close()
 
-	log.Println("DuckDB (Inspect): Installing and loading Parquet extension...")
+	logger.Debug("Installing and loading Parquet extension for inspection.")
 	setupSQL := `INSTALL parquet; LOAD parquet;`
-	if _, err := conn.ExecContext(context.Background(), setupSQL); err != nil {
-		// Log warning but potentially continue if extension loaded previously
-		log.Printf("WARN: Failed to install/load parquet extension: %v. Inspection might fail.", err)
-		// Return error as inspection requires it
-		return fmt.Errorf("install/load parquet extension: %w", err)
-
+	if _, err := conn.ExecContext(ctx, setupSQL); err != nil {
+		// Log warning but continue cautiously, extension might be preloaded/installed
+		logger.Warn("Failed to install/load parquet extension. Inspection might fail if not already available.", "error", err)
 	} else {
-		log.Println("DuckDB (Inspect): Parquet extension loaded.")
+		logger.Debug("Parquet extension loaded (or already available).")
 	}
 
-	// Use output dir from config
 	globPattern := filepath.Join(cfg.OutputDir, "*.parquet")
 	parquetFiles, err := filepath.Glob(globPattern)
 	if err != nil {
@@ -49,71 +57,104 @@ func InspectParquet(cfg config.Config) error {
 	}
 
 	if len(parquetFiles) == 0 {
-		log.Printf("No *.parquet files found in %s to inspect.", cfg.OutputDir)
+		logger.Info("No *.parquet files found to inspect.", slog.String("dir", cfg.OutputDir))
 		return nil
 	}
 
-	log.Printf("Found %d parquet files to inspect in %s", len(parquetFiles), cfg.OutputDir)
+	logger.Info("Inspecting parquet files", slog.Int("count", len(parquetFiles)), slog.String("dir", cfg.OutputDir))
 	var inspectErrors error
 
 	for _, filePath := range parquetFiles {
+		// Check context cancellation before processing each file
+		select {
+		case <-ctx.Done():
+			logger.Warn("Inspection cancelled by context.")
+			return errors.Join(inspectErrors, ctx.Err())
+		default:
+			// Continue processing file
+		}
+
 		baseName := filepath.Base(filePath)
-		log.Printf("--- Inspecting: %s ---", baseName)
-		// DuckDB path formatting
+		l := logger.With(slog.String("file", baseName)) // Logger with file context
+		l.Info("Inspecting file")
+
+		// Ensure correct path separators for DuckDB and escape single quotes
 		duckdbFilePath := strings.ReplaceAll(filePath, `\`, `/`)
 		escapedFilePath := strings.ReplaceAll(duckdbFilePath, "'", "''")
 
 		// Describe Schema
 		describeSQL := fmt.Sprintf("DESCRIBE SELECT * FROM read_parquet('%s');", escapedFilePath)
-		schemaRows, err := conn.QueryContext(context.Background(), describeSQL)
+		schemaRows, err := conn.QueryContext(ctx, describeSQL)
 		if err != nil {
-			log.Printf("  ERROR getting schema for %s: %v (SQL: %s)", baseName, err, describeSQL)
+			l.Error("Failed getting schema", "error", err)
 			inspectErrors = errors.Join(inspectErrors, fmt.Errorf("schema %s: %w", baseName, err))
-			continue
+			continue // Skip to next file
 		}
 
-		log.Println("  Schema:")
-		log.Printf("    %-30s | %-20s | %-5s | %-5s | %-5s | %s\n", "Column Name", "Column Type", "Null", "Key", "Default", "Extra")
-		log.Println("    " + strings.Repeat("-", 90))
+		l.Debug("Schema:") // Use Debug level for detailed schema output
 		schemaColumnCount := 0
+		fmt.Printf("--- Schema: %s ---\n", baseName) // Print header to stdout/stderr
+		fmt.Printf("  %-30s | %-20s | %-5s | %-5s | %-5s | %s\n", "Column Name", "Column Type", "Null", "Key", "Default", "Extra")
+		fmt.Println("  " + strings.Repeat("-", 90))
 		for schemaRows.Next() {
 			var colName, colType, nullVal, keyVal, defaultVal, extraVal sql.NullString
 			if scanErr := schemaRows.Scan(&colName, &colType, &nullVal, &keyVal, &defaultVal, &extraVal); scanErr != nil {
-				log.Printf("  ERROR scanning schema row for %s: %v", baseName, scanErr)
-				inspectErrors = errors.Join(inspectErrors, fmt.Errorf("scan schema row %s: %w", baseName, scanErr))
-				break
+				l.Error("Failed scanning schema row", "error", scanErr)
+				inspectErrors = errors.Join(inspectErrors, fmt.Errorf("scan schema %s: %w", baseName, scanErr))
+				break // Stop scanning schema for this file
 			}
-			log.Printf("    %-30s | %-20s | %-5s | %-5s | %-5s | %s\n", colName.String, colType.String, nullVal.String, keyVal.String, defaultVal.String, extraVal.String)
+			// Log detailed schema info
+			l.Debug("Column",
+				slog.String("name", colName.String),
+				slog.String("type", colType.String),
+				slog.String("null", nullVal.String),
+				slog.String("key", keyVal.String),
+				slog.String("default", defaultVal.String),
+				slog.String("extra", extraVal.String),
+			)
+			// Print human-readable schema
+			fmt.Printf("  %-30s | %-20s | %-5s | %-5s | %-5s | %s\n",
+				colName.String, colType.String, nullVal.String, keyVal.String, defaultVal.String, extraVal.String)
 
 			// Basic check for date column type
 			if strings.Contains(strings.ToLower(colName.String), "datetime") && colType.String != "BIGINT" && colType.String != "NULL" {
-				log.Printf("    >>> UNEXPECTED TYPE for date col '%s': Expected BIGINT, got %s <<<", colName.String, colType.String)
+				warnMsg := fmt.Sprintf(">>> UNEXPECTED TYPE for date col '%s': Expected BIGINT, got %s <<<", colName.String, colType.String)
+				l.Warn(warnMsg)
+				fmt.Printf("  %s\n", warnMsg) // Print warning too
 			}
 			schemaColumnCount++
 		}
-		if err = schemaRows.Err(); err != nil {
-			log.Printf("  ERROR iterating schema rows for %s: %v", baseName, err)
-			inspectErrors = errors.Join(inspectErrors, fmt.Errorf("iterate schema rows %s: %w", baseName, err))
+		schemaErr := schemaRows.Err() // Check errors after iterating
+		if schemaErr != nil {
+			l.Error("Error iterating schema rows", "error", schemaErr)
+			inspectErrors = errors.Join(inspectErrors, fmt.Errorf("iterate schema %s: %w", baseName, schemaErr))
 		}
-		schemaRows.Close()
+		schemaRows.Close() // Close rows
 
-		if schemaColumnCount == 0 && err == nil {
-			log.Println("  WARN: DESCRIBE returned no columns. File might be empty or invalid.")
+		if schemaColumnCount == 0 && schemaErr == nil {
+			l.Warn("DESCRIBE returned no columns. File might be empty or invalid.")
+			fmt.Println("  WARN: DESCRIBE returned no columns. File might be empty or invalid.")
 		}
 
 		// Get Row Count
 		countSQL := fmt.Sprintf("SELECT COUNT(*) FROM read_parquet('%s');", escapedFilePath)
 		var rowCount int64 = -1
-		err = conn.QueryRowContext(context.Background(), countSQL).Scan(&rowCount)
+		// Use a separate context timeout for potentially long count query? Or rely on overall ctx.
+		err = conn.QueryRowContext(ctx, countSQL).Scan(&rowCount)
 		if err != nil {
-			log.Printf("  ERROR getting row count for %s: %v (SQL: %s)", baseName, err, countSQL)
+			l.Error("Failed getting row count", "error", err)
 			inspectErrors = errors.Join(inspectErrors, fmt.Errorf("count %s: %w", baseName, err))
+			fmt.Println("  ERROR getting row count:", err)
 		} else {
-			log.Printf("  Row Count: %d", rowCount)
+			l.Info("File inspection summary", slog.Int64("row_count", rowCount))
+			fmt.Printf("  Row Count: %d\n", rowCount)
 		}
-		log.Println(strings.Repeat("-", 40))
-	}
+		fmt.Println(strings.Repeat("-", 40)) // Separator for next file
+	} // End loop parquetFiles
 
-	log.Println("--- Parquet File Inspection Finished ---")
+	logger.Info("--- Parquet File Inspection Finished ---")
+	if inspectErrors != nil {
+		logger.Warn("Inspection completed with errors.", "error", inspectErrors)
+	}
 	return inspectErrors
 }

@@ -1,249 +1,202 @@
 package processor
 
 import (
-	"bufio"
+	"archive/zip" // Need zip package here now
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
-	"log"
-	"os"
+	"io" // Need io for reader
+	"log/slog"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	// Use your actual module path
 	"github.com/brensch/nemparquet/internal/config"
-	"github.com/brensch/nemparquet/internal/util" // Use your module name
+	"github.com/brensch/nemparquet/internal/db"
+	"github.com/brensch/nemparquet/internal/util"
 
-	"github.com/xitongsys/parquet-go-source/local"
+	"github.com/xitongsys/parquet-go-source/local" // Keep for writer target
 	"github.com/xitongsys/parquet-go/parquet"
-	"github.com/xitongsys/parquet-go/source"
+	"github.com/xitongsys/parquet-go/source" // Keep for writer target
 	"github.com/xitongsys/parquet-go/writer"
 )
 
-// ProcessProgress tracks CSV processing.
-type ProcessProgress struct {
-	TotalFiles     int           // Total CSV files found
-	FilesProcessed int           // Number of files attempted
-	CurrentFile    string        // Path of the file being processed
-	LinesProcessed int64         // Lines read/processed in the current file
-	TotalLines     int64         // Estimated total lines (optional, -1 if unknown)
-	Complete       bool          // True if processing of current file finished
-	Skipped        bool          // True if the file was skipped (output exists)
-	Err            error         // Error for the current file
-	ElapsedTime    time.Duration // Time taken for the current file
-}
-
-// ProcessFiles finds CSVs and processes them concurrently.
-func ProcessFiles(cfg config.Config, progressChan chan<- ProcessProgress) error {
-	log.Println("Searching for CSV files...")
-	globPath := filepath.Join(cfg.InputDir, "*.[cC][sS][vV]")
-	csvFiles, err := filepath.Glob(globPath)
-	if err != nil {
-		return fmt.Errorf("failed to glob for CSV files in %s: %w", cfg.InputDir, err)
-	}
-
-	if len(csvFiles) == 0 {
-		log.Printf("INFO: No *.CSV files found in %s to process.", cfg.InputDir)
-		close(progressChan) // Close channel, nothing to report
-		return nil
-	}
-
-	log.Printf("Found %d CSV files to process.", len(csvFiles))
-
-	// Setup for parallel processing
-	numFiles := len(csvFiles)
-	jobs := make(chan string, numFiles)
-	// Use a channel for results/errors as well
-	results := make(chan ProcessProgress, numFiles) // Channel to receive final status of each file
-
-	var wg sync.WaitGroup
-
-	// Start worker goroutines
-	log.Printf("Starting %d processing workers...", cfg.NumWorkers)
-	for i := 0; i < cfg.NumWorkers; i++ {
-		wg.Add(1)
+// StartProcessorWorkers launches goroutines to process zip paths from a channel.
+// It waits for all workers to finish using the provided WaitGroup.
+// Errors encountered by workers are stored in the provided sync.Map.
+func StartProcessorWorkers(
+	ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger,
+	numWorkers int, pathsChan <-chan string, // Read from channel
+	wg *sync.WaitGroup, errorsMap *sync.Map, // Use pointers for WG and Map
+	forceProcess bool,
+) {
+	logger.Info("Starting processor workers", slog.Int("count", numWorkers))
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1) // Add to WG for each worker started
 		go func(workerID int) {
-			defer wg.Done()
-			log.Printf("Worker %d started.", workerID)
-			for csvPath := range jobs {
+			defer wg.Done() // Signal completion when goroutine exits
+			l := logger.With(slog.Int("worker_id", workerID))
+			l.Debug("Processing worker started")
+
+			// Read zip file paths from the channel until it's closed
+			for zipFilePath := range pathsChan {
+				// Create a new logger instance for this specific job with its context
+				jobLogger := l.With(slog.String("zip_file_path", zipFilePath))
+
+				jobLogger.Info("Checking processing state.")
+				// 1. Find original URL from DB using output path
+				absZipFilePath, pathErr := filepath.Abs(zipFilePath)
+				if pathErr != nil {
+					jobLogger.Error("Failed get absolute path, skipping.", "error", pathErr)
+					errorsMap.Store(zipFilePath, pathErr) // Store error against the path key
+					continue                              // Skip to next job
+				}
+
+				originalZipURL, foundURL, dbErr := db.GetZipURLForOutputPath(ctx, dbConn, absZipFilePath)
+				if dbErr != nil {
+					jobLogger.Error("DB error finding original URL, skipping.", "error", dbErr)
+					errorsMap.Store(zipFilePath, dbErr)
+					continue
+				}
+				if !foundURL {
+					jobLogger.Warn("Could not find original download URL in DB for this zip file, skipping.", slog.String("abs_path", absZipFilePath))
+					// Log a skip event? Or just let it be skipped silently? Log for now.
+					// Note: We don't have the original URL to log against here, which is the issue.
+					// We could log against the path, but that might pollute the log.
+					// errorsMap.Store(zipFilePath, fmt.Errorf("original URL not found in DB for path %s", absZipFilePath)) // Store skip reason as error?
+					continue
+				}
+				jobLogger = jobLogger.With(slog.String("zip_url", originalZipURL)) // Add URL context
+
+				// 2. Check if already processed successfully using the URL
+				processCompleted, dbErr := db.HasEventOccurred(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventProcessEnd)
+				if dbErr != nil {
+					jobLogger.Warn("Failed check DB state for process completion, proceeding cautiously.", "error", dbErr)
+					// Log DB error against the URL
+					db.LogFileEvent(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventError, "", "", fmt.Sprintf("db check process failed: %v", dbErr), "", nil)
+				}
+
+				if !forceProcess && processCompleted {
+					jobLogger.Info("Skipping processing, already completed according to DB.")
+					db.LogFileEvent(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventSkipProcess, "", "", "Already processed", "", nil)
+					continue // Skip to next job
+				}
+
+				jobLogger.Info("Starting processing.")
 				startTime := time.Now()
-				log.Printf("Worker %d processing %s...", workerID, csvPath)
-				baseName := filepath.Base(csvPath)
-				progress := ProcessProgress{
-					TotalFiles: numFiles,
-					// FilesProcessed will be updated by the main loop
-					CurrentFile: baseName,
-					TotalLines:  -1, // Line count estimation is hard without pre-scan
-				}
+				// Log process start for the *original URL*
+				db.LogFileEvent(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventProcessStart, "", "", "", "", nil)
 
-				// Report initial status (Processing) via results channel
-				results <- progress
+				// 3. Process the Zip Archive
+				processErr := processSingleZipArchive(ctx, cfg, jobLogger, zipFilePath, originalZipURL) // Pass job-specific logger
+				duration := time.Since(startTime)
 
-				// Call the core processing logic
-				skipped, processErr := processCSVSections(csvPath, cfg.OutputDir, cfg.SchemaRowLimit)
-
-				// Update progress with final status
-				progress.ElapsedTime = time.Since(startTime)
-				progress.Complete = true // Mark as finished attempt
-				if skipped {
-					progress.Skipped = true
-					log.Printf("Worker %d Skipped %s.", workerID, baseName)
-				} else if processErr != nil {
-					progress.Err = processErr
-					log.Printf("Worker %d ERROR processing %s: %v", workerID, baseName, processErr)
+				// 4. Log event based on result for the *original URL*
+				if processErr != nil {
+					jobLogger.Error("Failed to process zip archive", "error", processErr, slog.Duration("duration", duration.Round(time.Millisecond)))
+					db.LogFileEvent(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventError, "", "", processErr.Error(), "", &duration)
+					errorsMap.Store(zipFilePath, processErr) // Store error against path
 				} else {
-					log.Printf("Worker %d Finished %s successfully.", workerID, baseName)
+					jobLogger.Info("Processing successful.", slog.Duration("duration", duration.Round(time.Millisecond)))
+					db.LogFileEvent(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventProcessEnd, "", "", "", "", &duration)
 				}
 
-				results <- progress // Send final status for this file
-			}
-			log.Printf("Worker %d finished.", workerID)
+			} // End job loop (channel closed)
+			l.Debug("Processing worker finished")
 		}(i)
 	}
+}
 
-	// Send jobs to workers
-	for _, csvPath := range csvFiles {
-		jobs <- csvPath
+// processSingleZipArchive opens a zip archive from disk and processes contained CSVs.
+func processSingleZipArchive(ctx context.Context, cfg config.Config, logger *slog.Logger, zipFilePath string, originalZipURL string) error {
+	l := logger // Use logger with existing context (worker, zip path, zip url)
+
+	l.Debug("Opening zip archive from disk.")
+	zr, err := zip.OpenReader(zipFilePath)
+	if err != nil {
+		l.Error("Failed to open zip archive", "error", err)
+		return fmt.Errorf("zip.OpenReader %s: %w", zipFilePath, err)
 	}
-	close(jobs) // Signal no more jobs
+	defer zr.Close()
 
-	// Collect results and send progress updates to the UI
-	var overallErr error
-	filesProcessedCount := 0
+	var processingErrors error
+	csvFoundCount := 0
 
-	// Need a way to close the results channel *after* all workers are done.
-	// We can launch a separate goroutine to wait for the workers and then close results.
-	go func() {
-		wg.Wait()
-		close(results)
-		log.Println("All processing workers finished.")
-	}()
+	// Derive base name for parquet files from the zip file name
+	zipBaseName := strings.TrimSuffix(filepath.Base(zipFilePath), filepath.Ext(zipFilePath))
 
-	// Process results as they come in
-	for progress := range results {
-		// Check if it's an initial or final status update
-		// (Simple approach: only count final updates towards completion)
-		if progress.Complete || progress.Skipped || progress.Err != nil {
-			filesProcessedCount++
-			progress.FilesProcessed = filesProcessedCount // Update overall count
-			if progress.Err != nil {
-				overallErr = errors.Join(overallErr, fmt.Errorf("%s: %w", progress.CurrentFile, progress.Err))
-			}
+	// Loop through files within the zip archive
+	for _, f := range zr.File {
+		// Check context cancellation before processing each internal file
+		select {
+		case <-ctx.Done():
+			l.Warn("Processing cancelled.")
+			return errors.Join(processingErrors, ctx.Err()) // Combine errors with context error
+		default:
+			// Continue processing file
+		}
+
+		if f.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(f.Name), ".csv") {
+			continue
+		}
+		csvFoundCount++
+		csvBaseName := filepath.Base(f.Name)
+		csvLogger := l.With(slog.String("internal_csv", csvBaseName)) // Create logger specific to this CSV
+		csvLogger.Debug("Found CSV inside archive, starting stream processing.")
+
+		// Open the file *within* the zip archive
+		rc, err := f.Open()
+		if err != nil {
+			csvLogger.Error("Failed to open internal CSV file.", "error", err)
+			processingErrors = errors.Join(processingErrors, fmt.Errorf("open internal %s: %w", csvBaseName, err))
+			// Log CSV processing error event? Or just aggregate for zip error event? Aggregate for now.
+			continue // Process next file in zip
+		}
+
+		// Call the stream processor
+		streamErr := processCSVStream(ctx, cfg, csvLogger, rc, zipBaseName, cfg.OutputDir)
+		closeErr := rc.Close() // Close immediately after processing attempt
+
+		if streamErr != nil {
+			csvLogger.Error("Failed to process internal CSV stream.", "error", streamErr)
+			processingErrors = errors.Join(processingErrors, fmt.Errorf("process stream %s: %w", csvBaseName, streamErr))
+			// Log CSV error event?
+			// db.LogFileEvent(ctx, getDB(), csvBaseName, db.FileTypeCsv, db.EventError, originalZipURL, "", streamErr.Error(), "", nil) // Requires passing dbConn down
 		} else {
-			// This is the initial "Processing" status update
-			// We already sent it from the worker, but maybe update the UI progress count here?
-			progress.FilesProcessed = filesProcessedCount // Show current progress count
+			csvLogger.Debug("Successfully processed CSV stream to Parquet sections.")
 		}
-
-		progressChan <- progress // Forward to the UI model
+		if closeErr != nil {
+			// Log error closing the internal reader, but don't necessarily fail the whole zip for it
+			csvLogger.Warn("Error closing internal CSV reader.", "error", closeErr)
+			processingErrors = errors.Join(processingErrors, fmt.Errorf("close reader %s: %w", csvBaseName, closeErr))
+		}
 	}
 
-	// All results collected now
-	log.Println("--- Processing Summary ---")
-	// Summary logs can be handled by the TaskFinishedMsg in the UI layer
+	if csvFoundCount == 0 {
+		l.Info("No CSV files found within this zip archive.")
+		// Is this an error? Or just an empty zip? Treat as success for now.
+	} else if processingErrors != nil {
+		l.Warn("Finished processing zip, but encountered errors with internal CSVs.", "error", processingErrors)
+	} else {
+		l.Debug("Finished processing all CSVs found in zip archive.")
+	}
 
-	close(progressChan) // Signal UI no more progress updates
-	return overallErr
+	return processingErrors // Return aggregated errors from processing internal CSVs
 }
 
-// checkExistingOutputFiles (Moved from main, minor change to use SchemaRowLimit) - Remains largely the same logic
-func checkExistingOutputFiles(csvPath, outDir string, schemaRowLimit int) (bool, error) {
-	// ... (Keep the original implementation, just pass schemaRowLimit if needed, although it's not directly used here)
-	// ... (Make sure logging uses log package)
-	baseName := strings.TrimSuffix(filepath.Base(csvPath), filepath.Ext(csvPath))
-	potentialOutputs := []string{}
+// processCSVStream reads CSV data from a reader (e.g., from within a zip)
+// and writes Parquet sections.
+func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logger, csvReader io.Reader, zipBaseName string, outputDir string) error {
+	// This function mirrors the logic of the old processSingleCSV/processCSVSections,
+	// but operates on a Reader instead of opening a file path.
 
-	file, err := os.Open(csvPath)
-	if err != nil {
-		log.Printf(" [%s] WARN: Could not open input CSV for pre-check: %v. Assuming processing is needed.", baseName, err)
-		return false, nil
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 1*1024*1024)
-
-	lineNumber := 0
-	for scanner.Scan() {
-		lineNumber++
-		line := scanner.Text()
-		trimmedLine := strings.TrimSpace(line)
-		if trimmedLine == "" {
-			continue
-		}
-		rec := strings.Split(trimmedLine, ",")
-		if len(rec) == 0 {
-			continue
-		}
-		recordType := strings.TrimSpace(rec[0])
-
-		if recordType == "I" {
-			if len(rec) < 5 {
-				log.Printf("[%s] WARN line %d (pre-check): Malformed 'I' record: %s. Skipping.", baseName, lineNumber, line)
-				continue
-			}
-			comp, ver := strings.TrimSpace(rec[2]), strings.TrimSpace(rec[3])
-			if comp != "" && ver != "" {
-				fileName := fmt.Sprintf("%s_%s_v%s.parquet", baseName, comp, ver)
-				potentialOutputs = append(potentialOutputs, fileName)
-			} else {
-				log.Printf("[%s] WARN line %d (pre-check): 'I' record has empty component or version: %s. Skipping.", baseName, lineNumber, line)
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("[%s] WARN: Error during pre-check scan near line %d: %v. Assuming processing is needed.", baseName, lineNumber, err)
-		return false, nil
-	}
-
-	if len(potentialOutputs) == 0 {
-		log.Printf(" [%s] INFO: No 'I' records found during pre-check. Proceeding with processing.", baseName)
-		return false, nil
-	}
-
-	// Check existence
-	log.Printf(" [%s] Pre-checking existence of %d potential output files...", baseName, len(potentialOutputs))
-	allExist := true
-	for _, fname := range potentialOutputs {
-		fpath := filepath.Join(outDir, fname)
-		if _, err := os.Stat(fpath); os.IsNotExist(err) {
-			log.Printf(" [%s]   -> Output file %s does NOT exist. Processing required.", baseName, fname)
-			allExist = false
-			break
-		} else if err != nil {
-			log.Printf(" [%s] WARN: Error checking status of %s: %v. Assuming processing is needed.", baseName, fname, err)
-			allExist = false
-			break
-		}
-	}
-	return allExist, nil
-}
-
-// processCSVSections (Moved from main, adapted slightly)
-// Returns (skipped bool, error)
-func processCSVSections(csvPath, outDir string, schemaInferenceRowLimit int) (skipped bool, err error) {
-	baseName := strings.TrimSuffix(filepath.Base(csvPath), filepath.Ext(csvPath))
-
-	// Check existence first
-	allOutputsExist, checkErr := checkExistingOutputFiles(csvPath, outDir, schemaInferenceRowLimit)
-	if checkErr != nil {
-		log.Printf("[%s] ERROR during output file pre-check: %v. Attempting to process regardless.", baseName, checkErr)
-	}
-	if allOutputsExist {
-		return true, nil // Signal skipped
-	}
-
-	// --- Proceed with processing ---
-	file, err := os.Open(csvPath)
-	if err != nil {
-		return false, fmt.Errorf("open CSV %s: %w", csvPath, err)
-	}
-	defer file.Close()
-
-	scanner := util.NewPeekableScanner(file)            // Use utility scanner
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024) // Set buffer
+	scanner := util.NewPeekableScanner(csvReader) // Use scanner on the provided reader
+	// Buffer settings might need adjustment depending on typical line lengths
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024) // Example buffer
 
 	var pw *writer.CSVWriter
 	var fw source.ParquetFile
@@ -253,24 +206,38 @@ func processCSVSections(csvPath, outDir string, schemaInferenceRowLimit int) (sk
 	var isDateColumn []bool
 	var schemaInferred bool = false
 	var rowsCheckedForSchema int = 0
-	lineNumber := int64(0) // Use int64 to match progress reporting
+	lineNumber := int64(0)
+	var accumulatedErrors error
+	var currentParquetPath string // Track path for logging and closing
 
-	// --- Main Scanner Loop (largely unchanged logic, ensure logging uses 'log') ---
+	// Ensure final writer/file is closed if loop exits unexpectedly
+	defer func() {
+		if pw != nil {
+			logger.Warn("Closing Parquet writer due to unexpected exit in processCSVStream", slog.String("path", currentParquetPath))
+			if err := pw.WriteStop(); err != nil {
+				logger.Error("Error stopping Parquet writer on deferred close", "path", currentParquetPath, "error", err)
+			}
+		}
+		if fw != nil {
+			if err := fw.Close(); err != nil {
+				logger.Error("Error closing Parquet file on deferred close", "path", currentParquetPath, "error", err)
+			}
+		}
+	}()
+
+	// --- Main Scanner Loop (adapted for slog, takes reader) ---
 	for scanner.Scan() {
+		// Check context cancellation at the start of each line processing
+		select {
+		case <-ctx.Done():
+			logger.Warn("Stream processing cancelled.")
+			return errors.Join(accumulatedErrors, ctx.Err()) // Combine errors with context error
+		default:
+			// Continue processing line
+		}
+
 		lineNumber++
 		line := scanner.Text()
-		// ... (rest of the switch statement logic from the original function) ...
-		// ... (make sure all log.Printf calls are kept or adapted) ...
-		// ... (Use util.IsNEMDateTime and util.NEMDateTimeToEpochMS) ...
-
-		// --- Inside the 'D' case, before pw.WriteString ---
-		// Optional: Send line progress update (can be noisy)
-		// if pw != nil && lineNumber % 1000 == 0 { // Update every 1000 lines
-		//     // Need a way to pass the progress channel down here, complicates function signature
-		//     // Or, calculate progress only at the end based on line count.
-		// }
-
-		// --- Existing Switch Logic (Abbreviated) ---
 		trimmedLine := strings.TrimSpace(line)
 		if trimmedLine == "" {
 			continue
@@ -280,34 +247,32 @@ func processCSVSections(csvPath, outDir string, schemaInferenceRowLimit int) (sk
 			continue
 		}
 		recordType := strings.TrimSpace(rec[0])
+		l := logger.With(slog.Int64("line", lineNumber), slog.String("record_type", recordType))
 
 		switch recordType {
 		case "I":
-			// Finish previous section
+			// Finalize previous Parquet writer if active
 			if pw != nil {
-				log.Printf("   [%s] Finalizing section %s v%s...", baseName, currentComp, currentVer)
+				l.Debug("Finalizing previous section", slog.String("comp", currentComp), slog.String("ver", currentVer), slog.String("path", currentParquetPath))
 				if err := pw.WriteStop(); err != nil {
-					log.Printf("   [%s] WARN: Error stopping writer %s v%s: %v", baseName, currentComp, currentVer, err)
-					// Don't return error, just log? Or accumulate? Accumulate is better.
-					err = errors.Join(err, fmt.Errorf("stop writer %s v%s: %w", currentComp, currentVer, err))
-				} else {
-					log.Printf("   [%s] Successfully stopped writer for %s v%s", baseName, currentComp, currentVer)
+					l.Warn("Error stopping writer", "error", err)
+					accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("stop writer %s: %w", currentParquetPath, err))
 				}
-				if closeErr := fw.Close(); closeErr != nil {
-					log.Printf("   [%s] WARN: Error closing file %s v%s: %v", baseName, currentComp, currentVer, closeErr)
-					err = errors.Join(err, fmt.Errorf("close file %s v%s: %w", currentComp, currentVer, closeErr))
+				if err := fw.Close(); err != nil {
+					l.Warn("Error closing file", "error", err)
+					accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("close file %s: %w", currentParquetPath, err))
 				}
 				pw = nil
 				fw = nil
+				currentParquetPath = ""
 			}
-			// Reset for new section
 			currentMeta = nil
 			isDateColumn = nil
 			schemaInferred = false
-			rowsCheckedForSchema = 0
+			rowsCheckedForSchema = 0 // Reset for new section
 
 			if len(rec) < 5 {
-				log.Printf("[%s] WARN line %d: Malformed 'I' record: %s. Skipping section.", baseName, lineNumber, line)
+				l.Warn("Malformed 'I' record, skipping section", "record", line)
 				currentHeaders = nil
 				continue
 			}
@@ -317,25 +282,25 @@ func processCSVSections(csvPath, outDir string, schemaInferenceRowLimit int) (sk
 				currentHeaders = append(currentHeaders, strings.TrimSpace(h))
 			}
 			if len(currentHeaders) == 0 {
-				log.Printf("[%s] WARN line %d: 'I' record has no headers %s v%s. Skipping.", baseName, lineNumber, currentComp, currentVer)
+				l.Warn("'I' record has no header columns, skipping section.", "comp", currentComp, "ver", currentVer)
 				continue
 			}
-			log.Printf(" [%s] Found section header %s v%s at line %d", baseName, currentComp, currentVer, lineNumber)
+			l.Debug("Found section header.", slog.String("comp", currentComp), slog.String("ver", currentVer))
 
 		case "D":
 			if len(currentHeaders) == 0 {
 				continue
-			} // Skip if no valid header
+			} // Skip data if no header active
+			l = l.With(slog.String("comp", currentComp), slog.String("ver", currentVer)) // Add section context
 			if len(rec) < 4 {
-				log.Printf("[%s] WARN line %d: Malformed 'D' record: %s. Skipping.", baseName, lineNumber, line)
+				l.Warn("Malformed 'D' record, skipping row.", "record", line)
 				continue
 			}
-			// Extract values
 			values := make([]string, len(currentHeaders))
-			numDataColsInRecord := len(rec) - 4
+			numDataCols := len(rec) - 4
 			hasBlanks := false
 			for i := 0; i < len(currentHeaders); i++ {
-				if i < numDataColsInRecord {
+				if i < numDataCols {
 					values[i] = strings.TrimSpace(strings.Trim(rec[i+4], `"`))
 					if values[i] == "" {
 						hasBlanks = true
@@ -346,35 +311,28 @@ func processCSVSections(csvPath, outDir string, schemaInferenceRowLimit int) (sk
 				}
 			}
 
-			// --- Schema Inference (Mostly Unchanged) ---
-			if !schemaInferred {
+			if !schemaInferred { // --- Schema Inference ---
 				rowsCheckedForSchema++
 				peekedType, peekErr := scanner.PeekRecordType()
-				mustInferNow := !hasBlanks || (peekErr != nil || peekedType != "D") || rowsCheckedForSchema >= schemaInferenceRowLimit
-
+				mustInferNow := !hasBlanks || (peekErr != nil || peekedType != "D") || rowsCheckedForSchema >= cfg.SchemaRowLimit
 				if mustInferNow {
-					if hasBlanks && rowsCheckedForSchema >= schemaInferenceRowLimit {
-						log.Printf(" [%s] WARN line %d: Schema limit reached (%d). Inferring from blank row %s v%s.", baseName, lineNumber, schemaInferenceRowLimit, currentComp, currentVer)
-					} else if hasBlanks && (peekErr != nil || peekedType != "D") {
-						log.Printf(" [%s] WARN line %d: No clean row before next section/EOF %s v%s. Inferring from blank row.", baseName, lineNumber, currentComp, currentVer)
+					if hasBlanks {
+						l.Warn("Inferring schema from row with blanks", "attempt", rowsCheckedForSchema)
 					} else {
-						log.Printf(" [%s] Inferring schema for %s v%s from line %d (attempt %d)", baseName, currentComp, currentVer, lineNumber, rowsCheckedForSchema)
+						l.Debug("Inferring schema", "attempt", rowsCheckedForSchema)
 					}
-
-					// Perform inference
 					currentMeta = make([]string, len(currentHeaders))
 					isDateColumn = make([]bool, len(currentHeaders))
-					for i := range currentHeaders {
+					for i := range currentHeaders { // ... inference logic ...
 						var typ string
 						val := values[i]
 						isDate := false
-
-						if util.IsNEMDateTime(val) { // Use util func
+						if util.IsNEMDateTime(val) {
 							typ = "INT64"
 							isDate = true
 						} else if val == "" {
 							typ = "BYTE_ARRAY"
-						} else if _, pErr := strconv.ParseBool(val); pErr == nil { // Simpler bool check
+						} else if _, pErr := strconv.ParseBool(val); pErr == nil {
 							typ = "BOOLEAN"
 						} else if _, pErr := strconv.ParseInt(val, 10, 64); pErr == nil {
 							typ = "INT64"
@@ -384,134 +342,111 @@ func processCSVSections(csvPath, outDir string, schemaInferenceRowLimit int) (sk
 							typ = "BYTE_ARRAY"
 						}
 						isDateColumn[i] = isDate
-
-						// Clean header
-						cleanHeader := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(currentHeaders[i], " ", "_"), ".", "_"), ";", "_")
-						if cleanHeader == "" {
-							cleanHeader = fmt.Sprintf("column_%d", i)
+						cleanH := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(currentHeaders[i], " ", "_"), ".", "_"), ";", "_")
+						if cleanH == "" {
+							cleanH = fmt.Sprintf("column_%d", i)
 						}
-
-						// Build meta string
 						if typ == "BYTE_ARRAY" {
-							currentMeta[i] = fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", cleanHeader)
+							currentMeta[i] = fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", cleanH)
 						} else {
-							currentMeta[i] = fmt.Sprintf("name=%s, type=%s, repetitiontype=OPTIONAL", cleanHeader, typ)
+							currentMeta[i] = fmt.Sprintf("name=%s, type=%s, repetitiontype=OPTIONAL", cleanH, typ)
 						}
 					}
-					log.Printf(" [%s]     Inferred Schema for %s v%s: [%s]", baseName, currentComp, currentVer, strings.Join(currentMeta, "], ["))
+					l.Debug("Inferred schema", slog.String("schema_str", strings.Join(currentMeta, "; ")))
 
-					// Initialize Parquet writer
-					parquetFile := fmt.Sprintf("%s_%s_v%s.parquet", baseName, currentComp, currentVer)
-					path := filepath.Join(outDir, parquetFile)
+					// Initialize Parquet writer - use zipBaseName from argument
+					parquetFile := fmt.Sprintf("%s_%s_v%s.parquet", zipBaseName, currentComp, currentVer)
+					path := filepath.Join(outputDir, parquetFile)
+					currentParquetPath = path // Store path for potential deferred close
+
+					// Check if output file already exists - skip section if it does? Or overwrite?
+					// For simplicity, let's overwrite for now. Add flag later if needed.
+					// if _, statErr := os.Stat(path); statErr == nil {
+					//     l.Warn("Output parquet file already exists, skipping section.", "path", path)
+					//     currentHeaders = nil // Invalidate headers to skip data rows for this section
+					//     schemaInferred = false // Allow re-inferring if another 'I' appears
+					//     continue
+					// }
+
 					var createErr error
-					fw, createErr = local.NewLocalFileWriter(path)
+					fw, createErr = local.NewLocalFileWriter(path) // Write to output dir
 					if createErr != nil {
-						log.Printf("[%s] ERROR line %d: Failed create parquet file %s: %v. Skipping section %s v%s.", baseName, lineNumber, path, createErr, currentComp, currentVer)
+						l.Error("Failed create parquet file", "path", path, "error", createErr)
 						currentHeaders = nil
-						schemaInferred = false
-						err = errors.Join(err, fmt.Errorf("create file %s: %w", path, createErr)) // Accumulate error
-						continue
+						schemaInferred = false // Skip section
+						accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("create file %s: %w", path, createErr))
+						continue // Skip to next line in CSV, effectively skipping section data
 					}
-
-					pw, createErr = writer.NewCSVWriter(currentMeta, fw, 4) // 4 goroutines for writing
+					pw, createErr = writer.NewCSVWriter(currentMeta, fw, 4) // Use 4 write threads
 					if createErr != nil {
-						log.Printf("[%s] ERROR line %d: Failed init writer for %s: %v. Skipping section %s v%s.", baseName, lineNumber, path, createErr, currentComp, currentVer)
+						l.Error("Failed init parquet writer", "path", path, "error", createErr)
 						fw.Close()
 						pw = nil
 						currentHeaders = nil
-						schemaInferred = false
-						err = errors.Join(err, fmt.Errorf("create writer %s: %w", path, createErr)) // Accumulate error
+						schemaInferred = false // Skip section
+						accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("create writer %s: %w", path, createErr))
 						continue
 					}
 					pw.CompressionType = parquet.CompressionCodec_SNAPPY
-					log.Printf(" [%s]   Created writer for section %s v%s -> %s", baseName, currentComp, currentVer, path)
+					l.Debug("Created Parquet writer.", slog.String("path", path))
 					schemaInferred = true
 				} else {
-					// Skip blank row, wait for cleaner one
-					log.Printf(" [%s]   Skipping schema inference on blank row %d for %s v%s (attempt %d/%d)...", baseName, lineNumber, currentComp, currentVer, rowsCheckedForSchema, schemaInferenceRowLimit)
-					continue
+					l.Debug("Skipping schema inference on blank row, waiting for cleaner row.", slog.Int("attempt", rowsCheckedForSchema))
+					continue // Skip this data row, wait for inference
 				}
-			} // End schema inference
+			} // --- End Schema Inference ---
 
-			// --- Write Data Row (Mostly Unchanged) ---
 			if !schemaInferred || pw == nil {
 				continue
-			} // Safeguard
-
+			} // --- Write Data Row ---
 			recPtrs := make([]*string, len(values))
-			for j := 0; j < len(values); j++ {
+			for j := 0; j < len(values); j++ { // ... data prep logic ...
 				isEmpty := values[j] == ""
 				finalValue := values[j]
-
 				if isDateColumn[j] && !isEmpty {
-					epochMS, convErr := util.NEMDateTimeToEpochMS(values[j]) // Use util func
+					epochMS, convErr := util.NEMDateTimeToEpochMS(values[j])
 					if convErr != nil {
-						originalVal := "OOB"
-						if j+4 < len(rec) {
-							originalVal = rec[j+4]
-						}
-						log.Printf(" [%s] WARN line %d: Failed convert date '%s' (orig: '%s') col '%s': %v. Writing NULL.", baseName, lineNumber, values[j], originalVal, currentHeaders[j], convErr)
+						l.Warn("Failed convert date, writing NULL.", "column", currentHeaders[j], "value", values[j], "error", convErr)
 						recPtrs[j] = nil
 						continue
 					}
 					finalValue = strconv.FormatInt(epochMS, 10)
 				}
-
-				isTargetStringType := false
-				if j < len(currentMeta) {
-					isTargetStringType = strings.Contains(currentMeta[j], "type=BYTE_ARRAY")
-				}
-
-				if isEmpty && !isTargetStringType {
+				isTargetString := j < len(currentMeta) && strings.Contains(currentMeta[j], "type=BYTE_ARRAY")
+				if isEmpty && !isTargetString {
 					recPtrs[j] = nil
 				} else {
 					temp := finalValue
 					recPtrs[j] = &temp
 				}
 			}
-
-			// Write
 			if writeErr := pw.WriteString(recPtrs); writeErr != nil {
-				// Detailed error logging for write errors (keep original logic)
-				problematicData, schemaForProblem := "N/A", "N/A"
-				// ... (logic to find problematic column/schema) ...
-				log.Printf("[%s] WARN line %d: WriteString error %s v%s: %v. Schema: [%s]. Cause: %s. Raw: %v",
-					baseName, lineNumber, currentComp, currentVer, writeErr, schemaForProblem, problematicData, values)
-				// Don't return error for write warnings, just log? Or accumulate? Let's just log for now.
+				l.Warn("WriteString error, skipping row.", "error", writeErr) // Don't log data by default
+				// accumulatedErrors = errors.Join(accumulatedErrors, writeErr) // Optionally accumulate write errors
 			}
 
-		// case "T": // Trailer - handled by EOF
-		default: // Ignore other record types ('C', 'H', etc.)
+		default: // Ignore other record types
 			continue
 		}
-
 	} // End scanner loop
 
-	// Finalize last section
+	// Finalize last section normally (defer handles unexpected exits)
 	if pw != nil {
-		log.Printf(" [%s] Finalizing last section %s v%s...", baseName, currentComp, currentVer)
-		if stopErr := pw.WriteStop(); stopErr != nil {
-			log.Printf("[%s] ERROR: Failed stop writer last section %s v%s: %v", baseName, currentComp, currentVer, stopErr)
-			err = errors.Join(err, fmt.Errorf("stop writer last %s v%s: %w", currentComp, currentVer, stopErr))
-		} else {
-			log.Printf(" [%s] Successfully stopped writer last section %s v%s", baseName, currentComp, currentVer)
+		logger.Debug("Finalizing last section", slog.String("comp", currentComp), slog.String("ver", currentVer), slog.String("path", currentParquetPath))
+		if err := pw.WriteStop(); err != nil {
+			logger.Warn("Error stopping writer for last section", "error", err)
+			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("stop writer %s: %w", currentParquetPath, err))
 		}
-		if closeErr := fw.Close(); closeErr != nil {
-			log.Printf("[%s] ERROR: Failed close file last section %s v%s: %v", baseName, currentComp, currentVer, closeErr)
-			err = errors.Join(err, fmt.Errorf("close file last %s v%s: %w", currentComp, currentVer, closeErr))
+		if err := fw.Close(); err != nil {
+			logger.Warn("Error closing file for last section", "error", err)
+			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("close file %s: %w", currentParquetPath, err))
 		}
 	}
-
-	// Check for scanner errors
+	// Check for scanner errors at the end
 	if scanErr := scanner.Err(); scanErr != nil {
-		errMsg := fmt.Sprintf("scanner error near line %d: %v", lineNumber, scanErr)
-		if errors.Is(scanErr, bufio.ErrTooLong) {
-			errMsg = fmt.Sprintf("scanner error: line too long near line %d (increase buffer)", lineNumber)
-		}
-		log.Printf("[%s] ERROR: %s", baseName, errMsg)
-		err = errors.Join(err, fmt.Errorf("scanner error CSV %s: %w", csvPath, scanErr)) // Return scanner error
+		logger.Error("Scanner error processing stream", "error", scanErr)
+		accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("scanner: %w", scanErr))
 	}
 
-	// Return accumulated errors
-	return false, err // Processed (attempted), return accumulated error
+	return accumulatedErrors
 }

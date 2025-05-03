@@ -7,34 +7,35 @@ import (
 	"time"
 )
 
-// DownloadFile fetches a file from a URL.
-func DownloadFile(client *http.Client, url string) ([]byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request for %s: %w", url, err)
-	}
-	req.Header.Set("User-Agent", "NEMParquetConverter/1.0 (Go-client)")
-
+// DownloadFile executes a pre-built HTTP request and returns the body bytes.
+// It handles response closing and non-200 status codes.
+// The caller is responsible for creating the request (including context and headers).
+func DownloadFile(client *http.Client, req *http.Request) ([]byte, error) {
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http get %s: %w", url, err)
+		// Include URL from request in error message
+		return nil, fmt.Errorf("http do request for %s: %w", req.URL.String(), err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() // Ensure body is closed
 
 	if resp.StatusCode != http.StatusOK {
-		limitReader := io.LimitReader(resp.Body, 512)
+		// Read some of the body for context on error
+		limitReader := io.LimitReader(resp.Body, 512) // Read up to 512 bytes
 		bodyBytes, _ := io.ReadAll(limitReader)
-		return nil, fmt.Errorf("bad status '%s' fetching %s: %s", resp.Status, url, string(bodyBytes))
+		// Include URL and status in the error
+		return nil, fmt.Errorf("bad status '%s' fetching %s: %s", resp.Status, req.URL.String(), string(bodyBytes))
 	}
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read body from %s: %w", url, err)
+		// Include URL in error message
+		return nil, fmt.Errorf("failed reading body from %s: %w", req.URL.String(), err)
 	}
 	return bodyBytes, nil
 }
 
-// DefaultHTTPClient creates a default client with a timeout.
+// DefaultHTTPClient creates a default http.Client with a reasonable timeout.
 func DefaultHTTPClient() *http.Client {
+	// Consider customizing transport settings (MaxIdleConns, etc.) if needed
 	return &http.Client{Timeout: 120 * time.Second}
 }
