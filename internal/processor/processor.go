@@ -26,8 +26,6 @@ import (
 )
 
 // StartProcessorWorkers launches goroutines to process zip paths from a channel.
-// It waits for all workers to finish using the provided WaitGroup.
-// Errors encountered by workers are stored in the provided sync.Map.
 func StartProcessorWorkers(
 	ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger,
 	numWorkers int, pathsChan <-chan string, // Read from channel
@@ -64,10 +62,8 @@ func StartProcessorWorkers(
 				}
 				if !foundURL {
 					jobLogger.Warn("Could not find original download URL in DB for this zip file, skipping.", slog.String("abs_path", absZipFilePath))
-					// Log a skip event? Or just let it be skipped silently? Log for now.
-					// Note: We don't have the original URL to log against here, which is the issue.
-					// We could log against the path, but that might pollute the log.
-					// errorsMap.Store(zipFilePath, fmt.Errorf("original URL not found in DB for path %s", absZipFilePath)) // Store skip reason as error?
+					// Optionally store a specific error/skip reason
+					// errorsMap.Store(zipFilePath, fmt.Errorf("original URL not found in DB for path %s", absZipFilePath))
 					continue
 				}
 				jobLogger = jobLogger.With(slog.String("zip_url", originalZipURL)) // Add URL context
@@ -76,7 +72,6 @@ func StartProcessorWorkers(
 				processCompleted, dbErr := db.HasEventOccurred(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventProcessEnd)
 				if dbErr != nil {
 					jobLogger.Warn("Failed check DB state for process completion, proceeding cautiously.", "error", dbErr)
-					// Log DB error against the URL
 					db.LogFileEvent(ctx, dbConn, originalZipURL, db.FileTypeZip, db.EventError, "", "", fmt.Sprintf("db check process failed: %v", dbErr), "", nil)
 				}
 
@@ -153,7 +148,6 @@ func processSingleZipArchive(ctx context.Context, cfg config.Config, logger *slo
 		if err != nil {
 			csvLogger.Error("Failed to open internal CSV file.", "error", err)
 			processingErrors = errors.Join(processingErrors, fmt.Errorf("open internal %s: %w", csvBaseName, err))
-			// Log CSV processing error event? Or just aggregate for zip error event? Aggregate for now.
 			continue // Process next file in zip
 		}
 
@@ -164,13 +158,10 @@ func processSingleZipArchive(ctx context.Context, cfg config.Config, logger *slo
 		if streamErr != nil {
 			csvLogger.Error("Failed to process internal CSV stream.", "error", streamErr)
 			processingErrors = errors.Join(processingErrors, fmt.Errorf("process stream %s: %w", csvBaseName, streamErr))
-			// Log CSV error event?
-			// db.LogFileEvent(ctx, getDB(), csvBaseName, db.FileTypeCsv, db.EventError, originalZipURL, "", streamErr.Error(), "", nil) // Requires passing dbConn down
 		} else {
 			csvLogger.Debug("Successfully processed CSV stream to Parquet sections.")
 		}
 		if closeErr != nil {
-			// Log error closing the internal reader, but don't necessarily fail the whole zip for it
 			csvLogger.Warn("Error closing internal CSV reader.", "error", closeErr)
 			processingErrors = errors.Join(processingErrors, fmt.Errorf("close reader %s: %w", csvBaseName, closeErr))
 		}
@@ -178,7 +169,6 @@ func processSingleZipArchive(ctx context.Context, cfg config.Config, logger *slo
 
 	if csvFoundCount == 0 {
 		l.Info("No CSV files found within this zip archive.")
-		// Is this an error? Or just an empty zip? Treat as success for now.
 	} else if processingErrors != nil {
 		l.Warn("Finished processing zip, but encountered errors with internal CSVs.", "error", processingErrors)
 	} else {
@@ -191,12 +181,8 @@ func processSingleZipArchive(ctx context.Context, cfg config.Config, logger *slo
 // processCSVStream reads CSV data from a reader (e.g., from within a zip)
 // and writes Parquet sections.
 func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logger, csvReader io.Reader, zipBaseName string, outputDir string) error {
-	// This function mirrors the logic of the old processSingleCSV/processCSVSections,
-	// but operates on a Reader instead of opening a file path.
-
-	scanner := util.NewPeekableScanner(csvReader) // Use scanner on the provided reader
-	// Buffer settings might need adjustment depending on typical line lengths
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024) // Example buffer
+	scanner := util.NewPeekableScanner(csvReader)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 
 	var pw *writer.CSVWriter
 	var fw source.ParquetFile
@@ -210,30 +196,37 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 	var accumulatedErrors error
 	var currentParquetPath string // Track path for logging and closing
 
-	// Ensure final writer/file is closed if loop exits unexpectedly
+	// Defer cleanup for unexpected exits (errors, panics, context cancellation)
 	defer func() {
 		if pw != nil {
-			logger.Warn("Closing Parquet writer due to unexpected exit in processCSVStream", slog.String("path", currentParquetPath))
-			if err := pw.WriteStop(); err != nil {
-				logger.Error("Error stopping Parquet writer on deferred close", "path", currentParquetPath, "error", err)
-			}
-		}
-		if fw != nil {
-			if err := fw.Close(); err != nil {
-				logger.Error("Error closing Parquet file on deferred close", "path", currentParquetPath, "error", err)
+			// Check if exiting normally (accumulatedErrors is nil AND context is not Done)
+			// If exiting normally, the cleanup after the loop should handle it.
+			// Only log/cleanup here if exiting abnormally.
+			normalExit := accumulatedErrors == nil && ctx.Err() == nil
+			if !normalExit {
+				logger.Warn("Closing Parquet writer/file due to error or cancellation in processCSVStream",
+					slog.String("path", currentParquetPath),
+					slog.Any("accumulated_error", accumulatedErrors),
+					slog.Any("context_error", ctx.Err()),
+				)
+				if stopErr := pw.WriteStop(); stopErr != nil {
+					logger.Error("Error stopping Parquet writer on deferred close", "path", currentParquetPath, "error", stopErr)
+				}
+				if closeErr := fw.Close(); closeErr != nil {
+					logger.Error("Error closing Parquet file on deferred close", "path", currentParquetPath, "error", closeErr)
+				}
 			}
 		}
 	}()
 
-	// --- Main Scanner Loop (adapted for slog, takes reader) ---
+	// --- Main Scanner Loop ---
 	for scanner.Scan() {
-		// Check context cancellation at the start of each line processing
 		select {
 		case <-ctx.Done():
 			logger.Warn("Stream processing cancelled.")
-			return errors.Join(accumulatedErrors, ctx.Err()) // Combine errors with context error
+			accumulatedErrors = errors.Join(accumulatedErrors, ctx.Err())
+			return accumulatedErrors // Exit loop and function
 		default:
-			// Continue processing line
 		}
 
 		lineNumber++
@@ -264,15 +257,15 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 				}
 				pw = nil
 				fw = nil
-				currentParquetPath = ""
+				currentParquetPath = "" // Reset after successful close
 			}
 			currentMeta = nil
 			isDateColumn = nil
 			schemaInferred = false
-			rowsCheckedForSchema = 0 // Reset for new section
+			rowsCheckedForSchema = 0 // Reset
 
 			if len(rec) < 5 {
-				l.Warn("Malformed 'I' record, skipping section", "record", line)
+				l.Warn("Malformed 'I' record", "record", line)
 				currentHeaders = nil
 				continue
 			}
@@ -282,18 +275,18 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 				currentHeaders = append(currentHeaders, strings.TrimSpace(h))
 			}
 			if len(currentHeaders) == 0 {
-				l.Warn("'I' record has no header columns, skipping section.", "comp", currentComp, "ver", currentVer)
+				l.Warn("'I' record no headers", "comp", currentComp, "ver", currentVer)
 				continue
 			}
-			l.Debug("Found section header.", slog.String("comp", currentComp), slog.String("ver", currentVer))
+			l.Debug("Found section header.", "comp", currentComp, "ver", currentVer)
 
 		case "D":
 			if len(currentHeaders) == 0 {
 				continue
-			} // Skip data if no header active
-			l = l.With(slog.String("comp", currentComp), slog.String("ver", currentVer)) // Add section context
+			}
+			l = l.With(slog.String("comp", currentComp), slog.String("ver", currentVer))
 			if len(rec) < 4 {
-				l.Warn("Malformed 'D' record, skipping row.", "record", line)
+				l.Warn("Malformed 'D' record", "record", line)
 				continue
 			}
 			values := make([]string, len(currentHeaders))
@@ -316,14 +309,15 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 				peekedType, peekErr := scanner.PeekRecordType()
 				mustInferNow := !hasBlanks || (peekErr != nil || peekedType != "D") || rowsCheckedForSchema >= cfg.SchemaRowLimit
 				if mustInferNow {
+					// *** Log schema inference warning if needed ***
 					if hasBlanks {
-						l.Warn("Inferring schema from row with blanks", "attempt", rowsCheckedForSchema)
+						l.Warn("Inferring schema from row with blanks", "attempt", rowsCheckedForSchema, slog.Int("limit", cfg.SchemaRowLimit))
 					} else {
 						l.Debug("Inferring schema", "attempt", rowsCheckedForSchema)
 					}
 					currentMeta = make([]string, len(currentHeaders))
 					isDateColumn = make([]bool, len(currentHeaders))
-					for i := range currentHeaders { // ... inference logic ...
+					for i := range currentHeaders { /* ... inference logic ... */
 						var typ string
 						val := values[i]
 						isDate := false
@@ -353,37 +347,25 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 						}
 					}
 					l.Debug("Inferred schema", slog.String("schema_str", strings.Join(currentMeta, "; ")))
-
-					// Initialize Parquet writer - use zipBaseName from argument
 					parquetFile := fmt.Sprintf("%s_%s_v%s.parquet", zipBaseName, currentComp, currentVer)
 					path := filepath.Join(outputDir, parquetFile)
-					currentParquetPath = path // Store path for potential deferred close
-
-					// Check if output file already exists - skip section if it does? Or overwrite?
-					// For simplicity, let's overwrite for now. Add flag later if needed.
-					// if _, statErr := os.Stat(path); statErr == nil {
-					//     l.Warn("Output parquet file already exists, skipping section.", "path", path)
-					//     currentHeaders = nil // Invalidate headers to skip data rows for this section
-					//     schemaInferred = false // Allow re-inferring if another 'I' appears
-					//     continue
-					// }
-
+					currentParquetPath = path
 					var createErr error
-					fw, createErr = local.NewLocalFileWriter(path) // Write to output dir
+					fw, createErr = local.NewLocalFileWriter(path)
 					if createErr != nil {
 						l.Error("Failed create parquet file", "path", path, "error", createErr)
 						currentHeaders = nil
-						schemaInferred = false // Skip section
+						schemaInferred = false
 						accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("create file %s: %w", path, createErr))
-						continue // Skip to next line in CSV, effectively skipping section data
+						continue
 					}
-					pw, createErr = writer.NewCSVWriter(currentMeta, fw, 4) // Use 4 write threads
+					pw, createErr = writer.NewCSVWriter(currentMeta, fw, 4)
 					if createErr != nil {
 						l.Error("Failed init parquet writer", "path", path, "error", createErr)
 						fw.Close()
 						pw = nil
 						currentHeaders = nil
-						schemaInferred = false // Skip section
+						schemaInferred = false
 						accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("create writer %s: %w", path, createErr))
 						continue
 					}
@@ -391,8 +373,8 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 					l.Debug("Created Parquet writer.", slog.String("path", path))
 					schemaInferred = true
 				} else {
-					l.Debug("Skipping schema inference on blank row, waiting for cleaner row.", slog.Int("attempt", rowsCheckedForSchema))
-					continue // Skip this data row, wait for inference
+					l.Debug("Skipping schema inference on blank row", slog.Int("attempt", rowsCheckedForSchema))
+					continue
 				}
 			} // --- End Schema Inference ---
 
@@ -400,13 +382,13 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 				continue
 			} // --- Write Data Row ---
 			recPtrs := make([]*string, len(values))
-			for j := 0; j < len(values); j++ { // ... data prep logic ...
+			for j := 0; j < len(values); j++ { /* ... data prep logic ... */
 				isEmpty := values[j] == ""
 				finalValue := values[j]
 				if isDateColumn[j] && !isEmpty {
 					epochMS, convErr := util.NEMDateTimeToEpochMS(values[j])
 					if convErr != nil {
-						l.Warn("Failed convert date, writing NULL.", "column", currentHeaders[j], "value", values[j], "error", convErr)
+						l.Warn("Failed convert date", "col", currentHeaders[j], "val", values[j], "error", convErr)
 						recPtrs[j] = nil
 						continue
 					}
@@ -421,32 +403,42 @@ func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logge
 				}
 			}
 			if writeErr := pw.WriteString(recPtrs); writeErr != nil {
-				l.Warn("WriteString error, skipping row.", "error", writeErr) // Don't log data by default
-				// accumulatedErrors = errors.Join(accumulatedErrors, writeErr) // Optionally accumulate write errors
+				l.Warn("WriteString error", "error", writeErr)
 			}
 
-		default: // Ignore other record types
+		default:
 			continue
 		}
 	} // End scanner loop
 
-	// Finalize last section normally (defer handles unexpected exits)
-	if pw != nil {
-		logger.Debug("Finalizing last section", slog.String("comp", currentComp), slog.String("ver", currentVer), slog.String("path", currentParquetPath))
-		if err := pw.WriteStop(); err != nil {
-			logger.Warn("Error stopping writer for last section", "error", err)
-			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("stop writer %s: %w", currentParquetPath, err))
-		}
-		if err := fw.Close(); err != nil {
-			logger.Warn("Error closing file for last section", "error", err)
-			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("close file %s: %w", currentParquetPath, err))
+	// --- Reinstated Cleanup Block for Normal Loop Exit ---
+	// This runs only if the loop finishes without error or cancellation.
+	scanErr := scanner.Err() // Check scanner error *before* final cleanup
+	if scanErr == nil && ctx.Err() == nil {
+		// Finalize the very last section if one was active
+		if pw != nil {
+			logger.Debug("Finalizing last section after loop", slog.String("comp", currentComp), slog.String("ver", currentVer), slog.String("path", currentParquetPath))
+			if err := pw.WriteStop(); err != nil {
+				logger.Warn("Error stopping writer for last section", "error", err)
+				accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("stop writer %s: %w", currentParquetPath, err))
+			}
+			if err := fw.Close(); err != nil {
+				logger.Warn("Error closing file for last section", "error", err)
+				accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("close file %s: %w", currentParquetPath, err))
+			}
+			// Set to nil to prevent defer block from running cleanup again
+			pw = nil
+			fw = nil
+			currentParquetPath = ""
 		}
 	}
-	// Check for scanner errors at the end
-	if scanErr := scanner.Err(); scanErr != nil {
+	// --- End Reinstated Cleanup Block ---
+
+	// Check for scanner errors again after potential cleanup attempts
+	if scanErr != nil {
 		logger.Error("Scanner error processing stream", "error", scanErr)
 		accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("scanner: %w", scanErr))
 	}
 
-	return accumulatedErrors
+	return accumulatedErrors // Return accumulated errors (or nil if none)
 }
