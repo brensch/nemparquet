@@ -23,15 +23,16 @@ import (
 
 var (
 	// Config flags - bound in init()
-	cfgFile   string
-	inputDir  string
-	outputDir string
-	dbPath    string
-	workers   int
-	logFormat string
-	logLevel  string
-	logOutput string
-	feedUrls  []string
+	cfgFile         string
+	inputDir        string
+	outputDir       string
+	dbPath          string
+	workers         int
+	logFormat       string
+	logLevel        string
+	logOutput       string
+	feedUrls        []string
+	archiveFeedUrls []string
 
 	// Global instances populated in PersistentPreRunE
 	rootLogger *slog.Logger
@@ -122,7 +123,7 @@ Other commands allow inspecting data, running analysis separately, or viewing st
 
 		// --- 2. Load/Validate Config (from flags) ---
 		appConfig = config.Config{ /* ... */
-			InputDir: inputDir, OutputDir: outputDir, DbPath: dbPath, NumWorkers: workers, FeedURLs: feedUrls, SchemaRowLimit: config.DefaultSchemaRowLimit,
+			InputDir: inputDir, OutputDir: outputDir, DbPath: dbPath, NumWorkers: workers, FeedURLs: feedUrls, ArchiveFeedURLs: archiveFeedUrls, SchemaRowLimit: config.DefaultSchemaRowLimit,
 		}
 		rootLogger.Debug("Configuration loaded", slog.Any("config", appConfig))
 		if appConfig.InputDir == "" || appConfig.OutputDir == "" || appConfig.DbPath == "" {
@@ -216,6 +217,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&logOutput, "log-output", "stderr", "Log output destination (stderr, stdout, or file path)")
 	rootCmd.PersistentFlags().StringSliceVar(&feedUrls, "feed-url", config.DefaultFeedURLs, "Feed URLs to fetch discovery info from (can specify multiple)")
+	rootCmd.PersistentFlags().StringSliceVar(&archiveFeedUrls, "archive-feed-url", config.DefaultArchiveFeedURLs, "Feed URLs to fetch archive discovery info from (archives)")
 
 	rootCmd.Version = "0.2.2" // Incremented version
 }

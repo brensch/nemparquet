@@ -5,14 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog" // Keep slog for potential logging inside DB funcs if needed later
-	"os"       // Needed for os.Stat in GetWorkItems
+	"log/slog"
+	"os" // Needed for os.Stat in GetPathsToProcess
 	"path/filepath"
 	"strings"
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb" // Driver
-	// Removed: "github.com/lib/pq" // No longer needed
+	// "github.com/lib/pq" // No longer needed
 )
 
 // Constants for event types
@@ -20,20 +20,21 @@ const (
 	EventDiscovered    = "discovered"
 	EventDownloadStart = "download_start"
 	EventDownloadEnd   = "download_end"
-	EventExtractStart  = "extract_start" // Might not be used now
-	EventExtractEnd    = "extract_end"   // Might not be used now
+	EventExtractStart  = "extract_start" // Kept for potential future use, but not used in current workflow
+	EventExtractEnd    = "extract_end"   // Kept for potential future use, but not used in current workflow
 	EventProcessStart  = "process_start"
 	EventProcessEnd    = "process_end"
 	EventError         = "error"
 	EventSkipDownload  = "skip_download"
-	EventSkipExtract   = "skip_extract" // Might not be used now
+	EventSkipExtract   = "skip_extract" // Kept for potential future use
 	EventSkipProcess   = "skip_process"
 )
 
 // Constants for file types
 const (
-	FileTypeZip = "zip"
-	FileTypeCsv = "csv"
+	FileTypeZip          = "zip"           // Represents an individual data zip file (inner or current)
+	FileTypeCsv          = "csv"           // Represents a specific CSV section (less used for state now)
+	FileTypeOuterArchive = "outer_archive" // Represents the main archive zip containing other zips
 )
 
 // Schema SQL
@@ -41,19 +42,20 @@ const schemaSequenceSQL = `CREATE SEQUENCE IF NOT EXISTS event_log_id_seq;`
 const schemaTableSQL = `
 CREATE TABLE IF NOT EXISTS nem_event_log (
     log_id          BIGINT PRIMARY KEY DEFAULT nextval('event_log_id_seq'),
-    filename        VARCHAR NOT NULL,      -- zip URL or CSV base name
-    filetype        VARCHAR NOT NULL,      -- 'zip', 'csv'
+    filename        VARCHAR NOT NULL,      -- Identifier: zip URL, inner zip name, or outer archive URL
+    filetype        VARCHAR NOT NULL,      -- 'zip', 'csv', 'outer_archive'
     event           VARCHAR NOT NULL,
     event_timestamp TIMESTAMP NOT NULL,
-    source_url      VARCHAR,
-    output_path     VARCHAR,               -- Path where zip was saved or parquet generated
+    source_url      VARCHAR,               -- e.g., outer archive URL for an inner zip event
+    output_path     VARCHAR,               -- Path where inner zip was saved or parquet generated
     message         VARCHAR,
     sha256_hash     VARCHAR,
     duration_ms     BIGINT
 );
+-- Indices
 CREATE INDEX IF NOT EXISTS idx_nem_event_log_file ON nem_event_log (filename, filetype);
 CREATE INDEX IF NOT EXISTS idx_nem_event_log_event_time ON nem_event_log (event, event_timestamp);
-CREATE INDEX IF NOT EXISTS idx_nem_event_log_output_path ON nem_event_log (output_path); -- Index for new query
+CREATE INDEX IF NOT EXISTS idx_nem_event_log_output_path ON nem_event_log (output_path);
 `
 
 // InitializeSchema creates the sequence and tables in the correct order.
@@ -94,12 +96,13 @@ func LogFileEvent(ctx context.Context, db *sql.DB, filename, filetype, event, so
 		durationMs,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to log event '%s' for '%s': %w", event, filename, err)
+		// Add filetype context to error message
+		return fmt.Errorf("failed to log event '%s' for '%s' (type: %s): %w", event, filename, filetype, err)
 	}
 	return nil
 }
 
-// GetLatestFileEvent retrieves the most recent event record for a specific file.
+// GetLatestFileEvent retrieves the most recent event record for a specific file identifier and type.
 func GetLatestFileEvent(ctx context.Context, db *sql.DB, filename, filetype string) (event string, timestamp time.Time, message string, found bool, err error) {
 	query := `
         SELECT event, event_timestamp, message
@@ -120,7 +123,7 @@ func GetLatestFileEvent(ctx context.Context, db *sql.DB, filename, filetype stri
 	return event, timestamp, msg.String, true, nil
 }
 
-// HasEventOccurred checks if a specific event has ever happened for a file.
+// HasEventOccurred checks if a specific event has ever happened for a file identifier and type.
 func HasEventOccurred(ctx context.Context, db *sql.DB, filename, filetype, event string) (bool, error) {
 	query := `SELECT 1 FROM nem_event_log WHERE filename = ? AND filetype = ? AND event = ? LIMIT 1;`
 	var exists int
@@ -135,37 +138,34 @@ func HasEventOccurred(ctx context.Context, db *sql.DB, filename, filetype, event
 	return true, nil // Event has occurred
 }
 
-// GetCompletionStatusBatch checks a list of files for a specific completion event
+// GetCompletionStatusBatch checks a list of file identifiers for a specific completion event and file type
 // using a temporary table approach compatible with DuckDB.
-// Returns a map where the key is the filename and the value is true if the completion event exists.
+// Returns a map where the key is the filename identifier and the value is true if the completion event exists.
 func GetCompletionStatusBatch(ctx context.Context, db *sql.DB, filenames []string, filetype string, completionEvent string) (map[string]bool, error) {
 	completedFiles := make(map[string]bool)
 	if len(filenames) == 0 {
 		return completedFiles, nil
 	}
 
-	// Use a transaction for the multi-step temp table process
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction for batch check: %w", err)
+		return nil, fmt.Errorf("failed begin transaction for batch check: %w", err)
 	}
-	defer tx.Rollback() // Rollback is safe even after commit
+	defer tx.Rollback()
 
-	// 1. Create a temporary table
 	tempTableName := fmt.Sprintf("temp_files_to_check_%d", time.Now().UnixNano())
 	createTempTableSQL := fmt.Sprintf(`CREATE TEMP TABLE %s (filename TEXT PRIMARY KEY);`, tempTableName)
 	_, err = tx.ExecContext(ctx, createTempTableSQL)
 	if err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
-			return nil, fmt.Errorf("failed to create temp table %s: %w", tempTableName, err)
+			return nil, fmt.Errorf("failed create temp table %s: %w", tempTableName, err)
 		}
 	}
 
-	// 2. Insert filenames into the temporary table
 	insertSQL := fmt.Sprintf(`INSERT INTO %s (filename) VALUES (?)`, tempTableName)
 	stmt, err := tx.PrepareContext(ctx, insertSQL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to prepare insert statement for temp table %s: %w", tempTableName, err)
+		return nil, fmt.Errorf("failed prepare insert for temp table %s: %w", tempTableName, err)
 	}
 
 	for _, fn := range filenames {
@@ -176,25 +176,23 @@ func GetCompletionStatusBatch(ctx context.Context, db *sql.DB, filenames []strin
 		default:
 			if _, err := stmt.ExecContext(ctx, fn); err != nil {
 				stmt.Close()
-				return nil, fmt.Errorf("failed to insert filename '%s' into temp table %s: %w", fn, tempTableName, err)
+				return nil, fmt.Errorf("failed insert filename '%s' into temp table %s: %w", fn, tempTableName, err)
 			}
 		}
 	}
 	if err = stmt.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close insert statement for %s: %w", tempTableName, err)
+		return nil, fmt.Errorf("failed close insert statement for %s: %w", tempTableName, err)
 	}
 
-	// 3. Query the main log table joining with the temporary table
 	query := fmt.Sprintf(`
         SELECT DISTINCT el.filename
         FROM nem_event_log el
         JOIN %s tfc ON el.filename = tfc.filename
-        WHERE el.filetype = ?
-          AND el.event = ?;
+        WHERE el.filetype = ? AND el.event = ?;
     `, tempTableName)
 	rows, err := tx.QueryContext(ctx, query, filetype, completionEvent)
 	if err != nil {
-		return nil, fmt.Errorf("failed batch query status joining temp table %s (event=%s, type=%s): %w", tempTableName, completionEvent, filetype, err)
+		return nil, fmt.Errorf("failed batch query joining temp table %s (event=%s, type=%s): %w", tempTableName, completionEvent, filetype, err)
 	}
 
 	for rows.Next() {
@@ -211,158 +209,125 @@ func GetCompletionStatusBatch(ctx context.Context, db *sql.DB, filenames []strin
 	}
 	rows.Close()
 
-	// 4. Commit the transaction
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction for batch check: %w", err)
+		return nil, fmt.Errorf("failed commit transaction for batch check: %w", err)
 	}
 
 	return completedFiles, nil
 }
 
-// GetZipURLForOutputPath finds the original zip URL associated with a saved zip file path.
-func GetZipURLForOutputPath(ctx context.Context, db *sql.DB, outputPath string) (zipURL string, found bool, err error) {
+// GetIdentifierForOutputPath finds the original identifier (URL or inner zip name) and its filetype
+// associated with a saved zip file path by looking for the latest download_end event matching the path.
+func GetIdentifierForOutputPath(ctx context.Context, db *sql.DB, outputPath string) (identifier string, filetype string, found bool, err error) {
+	// We need both filename (identifier) and filetype associated with the output_path
 	query := `
-		SELECT filename
+		SELECT filename, filetype
 		FROM nem_event_log
-		WHERE output_path = ? AND event = ? AND filetype = ?
+		WHERE output_path = ? AND event = ?
 		ORDER BY event_timestamp DESC, log_id DESC
 		LIMIT 1;
 	`
-	row := db.QueryRowContext(ctx, query, outputPath, EventDownloadEnd, FileTypeZip)
-	err = row.Scan(&zipURL)
+	// Event download_end should have been logged with the output_path for both outer archives (if saved)
+	// and inner/regular zips.
+	row := db.QueryRowContext(ctx, query, outputPath, EventDownloadEnd)
+	err = row.Scan(&identifier, &filetype)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", false, nil // Not found
+			return "", "", false, nil // Not found
 		}
-		return "", false, fmt.Errorf("failed query zip URL for path '%s': %w", outputPath, err)
+		return "", "", false, fmt.Errorf("failed query identifier for path '%s': %w", outputPath, err)
 	}
-	return zipURL, true, nil
+	return identifier, filetype, true, nil
 }
 
-// GetWorkItems identifies files needing download or processing.
-// Takes the list of all *discovered* zip URLs as input.
-// Returns:
-// - urlsToDownload: List of zip URLs that haven't had a successful download_end event.
-// - pathsToProcess: List of local zip file paths that have been downloaded but not yet processed.
-func GetWorkItems(ctx context.Context, db *sql.DB, allDiscoveredURLs []string) (urlsToDownload []string, pathsToProcess []string, err error) {
-	urlsToDownload = []string{}
-	pathsToProcess = []string{}
-	if len(allDiscoveredURLs) == 0 {
-		return urlsToDownload, pathsToProcess, nil
-	}
+// GetPathsToProcess identifies local zip file paths (filetype='zip') that have been downloaded
+// but not yet successfully processed.
+func GetPathsToProcess(ctx context.Context, db *sql.DB) ([]string, error) {
+	paths := []string{}
 
-	// 1. Find which discovered URLs have *ever* had a download_end event
-	downloadedMap, err := GetCompletionStatusBatch(ctx, db, allDiscoveredURLs, FileTypeZip, EventDownloadEnd)
+	// 1. Get all distinct, non-null output paths associated with a 'zip' type download_end event
+	queryPaths := `
+		SELECT DISTINCT output_path
+		FROM nem_event_log
+		WHERE filetype = ? AND event = ? AND output_path IS NOT NULL AND output_path != '';
+	`
+	rowsPaths, err := db.QueryContext(ctx, queryPaths, FileTypeZip, EventDownloadEnd) // Only look for 'zip' type downloads
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed getting download status batch: %w", err)
+		return nil, fmt.Errorf("failed query downloaded zip paths: %w", err)
 	}
+	defer rowsPaths.Close()
 
-	// 2. Find which discovered URLs have *ever* had a process_end event
-	processedMap, err := GetCompletionStatusBatch(ctx, db, allDiscoveredURLs, FileTypeZip, EventProcessEnd)
+	potentialPaths := []string{}
+	for rowsPaths.Next() {
+		var path sql.NullString
+		if err := rowsPaths.Scan(&path); err != nil {
+			return nil, fmt.Errorf("failed scanning downloaded zip path: %w", err)
+		}
+		if path.Valid && path.String != "" {
+			potentialPaths = append(potentialPaths, path.String)
+		}
+	}
+	if err = rowsPaths.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating downloaded zip paths: %w", err)
+	}
+	rowsPaths.Close() // Close early
+
+	if len(potentialPaths) == 0 {
+		return paths, nil
+	} // No downloaded zip paths found
+
+	// 2. For each potential path, find its identifier and check if it has been processed
+	var checkErrors error
+	// Create map of processed identifiers (URLs or inner zip names) for efficiency
+	processedIdentifiers := make(map[string]bool)
+	queryProcessed := `SELECT DISTINCT filename FROM nem_event_log WHERE filetype = ? AND event = ?;`
+	rowsProcessed, err := db.QueryContext(ctx, queryProcessed, FileTypeZip, EventProcessEnd) // Check for 'zip' process end
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed getting process status batch: %w", err)
+		return nil, fmt.Errorf("failed query processed zip identifiers: %w", err)
+	}
+	for rowsProcessed.Next() {
+		var id string
+		if err := rowsProcessed.Scan(&id); err != nil {
+			rowsProcessed.Close()
+			return nil, fmt.Errorf("failed scanning processed zip identifier: %w", err)
+		}
+		processedIdentifiers[id] = true
+	}
+	rowsProcessed.Close()
+	if err = rowsProcessed.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating processed zip identifiers: %w", err)
 	}
 
-	// 3. Query to get the latest output_path for successfully downloaded files
-	urlsDownloadedNotProcessed := []string{}
-	for url := range downloadedMap {
-		if _, processed := processedMap[url]; !processed {
-			urlsDownloadedNotProcessed = append(urlsDownloadedNotProcessed, url)
-		}
-	}
-
-	outputPathMap := make(map[string]string) // Map URL -> Output Path
-	if len(urlsDownloadedNotProcessed) > 0 {
-		// Use temp table approach for potentially large list
-		tx, txErr := db.BeginTx(ctx, nil)
-		if txErr != nil {
-			return nil, nil, fmt.Errorf("begin tx for output paths: %w", txErr)
-		}
-		defer tx.Rollback() // Ensure rollback if commit doesn't happen
-
-		tempTableName := fmt.Sprintf("temp_urls_dnp_%d", time.Now().UnixNano())
-		createSQL := fmt.Sprintf(`CREATE TEMP TABLE %s (url TEXT PRIMARY KEY);`, tempTableName)
-		if _, err := tx.ExecContext(ctx, createSQL); err != nil {
-			return nil, nil, fmt.Errorf("create temp url table %s: %w", tempTableName, err)
-		}
-
-		insertSQL := fmt.Sprintf(`INSERT INTO %s (url) VALUES (?)`, tempTableName)
-		stmt, err := tx.PrepareContext(ctx, insertSQL)
+	// Now check each path
+	for _, p := range potentialPaths {
+		identifier, fType, found, err := GetIdentifierForOutputPath(ctx, db, p)
 		if err != nil {
-			return nil, nil, fmt.Errorf("prepare insert url %s: %w", tempTableName, err)
+			slog.Warn("Error finding identifier for path, skipping.", "path", p, "error", err)
+			checkErrors = errors.Join(checkErrors, err)
+			continue
 		}
-		for _, url := range urlsDownloadedNotProcessed {
-			if _, err := stmt.ExecContext(ctx, url); err != nil {
-				stmt.Close()
-				return nil, nil, fmt.Errorf("insert url %s: %w", url, err)
-			}
+		if !found {
+			slog.Warn("Could not find identifier for path in DB, skipping.", "path", p)
+			continue
 		}
-		stmt.Close()
-
-		query := fmt.Sprintf(`
-            WITH LatestDownload AS (
-                SELECT
-                    el.filename, el.output_path,
-                    ROW_NUMBER() OVER(PARTITION BY el.filename ORDER BY el.event_timestamp DESC, el.log_id DESC) as rn
-                FROM nem_event_log el
-                JOIN %s temp ON el.filename = temp.url
-                WHERE el.filetype = ? AND el.event = ? AND el.output_path IS NOT NULL AND el.output_path != ''
-            )
-            SELECT filename, output_path FROM LatestDownload WHERE rn = 1;
-        `, tempTableName)
-
-		rows, err := tx.QueryContext(ctx, query, FileTypeZip, EventDownloadEnd)
-		if err != nil {
-			return nil, nil, fmt.Errorf("query output paths for downloaded files: %w", err)
+		// Ensure we only process things logged as 'zip' type downloads
+		if fType != FileTypeZip {
+			slog.Debug("Identifier found for path, but filetype is not 'zip', skipping processing.", "path", p, "identifier", identifier, "filetype", fType)
+			continue
 		}
 
-		for rows.Next() {
-			var url string
-			var nullablePath sql.NullString
-			if err := rows.Scan(&url, &nullablePath); err != nil {
-				rows.Close()
-				return nil, nil, fmt.Errorf("scan output path row: %w", err)
-			}
-			if nullablePath.Valid {
-				outputPathMap[url] = nullablePath.String
-			}
-		}
-		rowsCloseErr := rows.Close()
-		if err = rows.Err(); err != nil {
-			return nil, nil, fmt.Errorf("iterate output path results: %w", err)
-		}
-		if rowsCloseErr != nil {
-			return nil, nil, fmt.Errorf("close output path rows: %w", rowsCloseErr)
-		}
-
-		if err = tx.Commit(); err != nil {
-			return nil, nil, fmt.Errorf("commit output path tx: %w", err)
-		}
-	}
-
-	// 4. Categorize all discovered URLs
-	for _, url := range allDiscoveredURLs {
-		_, downloaded := downloadedMap[url]
-		_, processed := processedMap[url]
-
-		if !downloaded {
-			urlsToDownload = append(urlsToDownload, url)
-		} else if !processed {
-			if path, ok := outputPathMap[url]; ok && path != "" {
-				if _, statErr := os.Stat(path); statErr == nil {
-					pathsToProcess = append(pathsToProcess, path)
-				} else {
-					slog.Warn("Downloaded file path found in DB but file missing on disk, queueing for re-download.", "url", url, "path", path, "error", statErr)
-					urlsToDownload = append(urlsToDownload, url)
-				}
+		if _, isProcessed := processedIdentifiers[identifier]; !isProcessed {
+			// Check if file actually exists before adding
+			if _, statErr := os.Stat(p); statErr == nil {
+				paths = append(paths, p)
 			} else {
-				slog.Warn("Downloaded file found but output path missing/empty in DB, queueing for re-download.", "url", url)
-				urlsToDownload = append(urlsToDownload, url)
+				slog.Warn("Downloaded path needs processing but file missing.", "path", p, "identifier", identifier, "error", statErr)
 			}
 		}
 	}
 
-	return urlsToDownload, pathsToProcess, nil
+	// Return paths and any non-fatal errors encountered during checks
+	return paths, checkErrors
 }
 
 // DisplayFileHistory queries and prints the event log for files.
@@ -394,7 +359,7 @@ func DisplayFileHistory(ctx context.Context, db *sql.DB, filetypeFilter, eventFi
 	args = append(args, limit)
 
 	fmt.Printf("--- Event Log History (Limit %d) ---\n", limit)
-	fmt.Printf("%-50s | %-8s | %-15s | %-25s | %-10s | %s\n", "Filename/URL", "Type", "Event", "Timestamp (UTC)", "DurationMS", "Message/Details")
+	fmt.Printf("%-50s | %-15s | %-15s | %-25s | %-10s | %s\n", "Identifier", "Type", "Event", "Timestamp (UTC)", "DurationMS", "Message/Details") // Adjusted header
 	fmt.Println(strings.Repeat("-", 150))
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -426,8 +391,14 @@ func DisplayFileHistory(ctx context.Context, db *sql.DB, filetypeFilter, eventFi
 			details += fmt.Sprintf(" (Output: %s)", filepath.Base(outputPath.String))
 		}
 
-		fmt.Printf("%-50s | %-8s | %-15s | %-25s | %-10s | %s\n",
-			filename, filetype, event, timestamp.Format(time.RFC3339), durationStr, details)
+		// Truncate filename if too long for display
+		displayFilename := filename
+		if len(displayFilename) > 50 {
+			displayFilename = "..." + displayFilename[len(displayFilename)-47:]
+		}
+
+		fmt.Printf("%-50s | %-15s | %-15s | %-25s | %-10s | %s\n",
+			displayFilename, filetype, event, timestamp.Format(time.RFC3339), durationStr, details)
 		count++
 	}
 	if err = rows.Err(); err != nil {

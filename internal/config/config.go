@@ -1,16 +1,19 @@
 package config
 
-// DefaultFeedURLs lists the standard NEMWEB directories to check for data.
-// This can be overridden by the --feed-url flag.
+// DefaultFeedURLs lists the standard NEMWEB "Current" directories containing individual data zip files.
+// Can be overridden by the --feed-url flag.
 var DefaultFeedURLs = []string{
-	// Current Reports
 	"https://nemweb.com.au/Reports/Current/FPP/",
 	"https://nemweb.com.au/Reports/Current/FPPDAILY/",
 	"https://nemweb.com.au/Reports/Current/FPPRATES/",
 	"https://nemweb.com.au/Reports/Current/FPPRUN/",
 	"https://nemweb.com.au/Reports/Current/PD7Day/",
 	"https://nemweb.com.au/Reports/Current/P5_Reports/",
+}
 
+// DefaultArchiveFeedURLs lists the NEMWEB "Archive" directories potentially containing zip files of zip files.
+// Can be overridden by the --archive-feed-url flag.
+var DefaultArchiveFeedURLs = []string{
 	"https://nemweb.com.au/Reports/Archive/FPPDAILY/",
 	"https://nemweb.com.au/Reports/Archive/FPPRATES/",
 	"https://nemweb.com.au/Reports/Archive/FPPRUN/", // Contains historical FPP_RCR data
@@ -25,9 +28,8 @@ const (
 )
 
 // Config holds application settings derived from flags or a potential config file.
-// These fields are typically populated during the PersistentPreRunE phase of the root command.
 type Config struct {
-	// InputDir specifies the directory where downloaded zip files are stored.
+	// InputDir specifies the directory where downloaded individual data zip files are stored.
 	// It's also scanned by the processor for zip files to process.
 	InputDir string
 
@@ -44,15 +46,12 @@ type Config struct {
 	// Defaults to the number of logical CPUs.
 	NumWorkers int
 
-	// FeedURLs lists the base URLs to scan for discovering zip files.
-	// Populated from DefaultFeedURLs or the --feed-url flag.
+	// FeedURLs lists the base URLs for "Current" data containing individual data zips.
 	FeedURLs []string
+
+	// ArchiveFeedURLs lists the base URLs for "Archive" data potentially containing zips of zips.
+	ArchiveFeedURLs []string
 
 	// SchemaRowLimit corresponds to DefaultSchemaRowLimit, potentially configurable later.
 	SchemaRowLimit int
-
-	// Add other potential settings here, e.g.:
-	// - Date Ranges for filtering downloads/processing
-	// - Specific analysis parameters
-	// - Overwrite flags (though often handled by command-specific flags like --force)
 }

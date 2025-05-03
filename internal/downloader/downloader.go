@@ -16,7 +16,7 @@ import (
 	"strings"
 	"sync"
 
-	// "sync/atomic" // No longer needed for sequential
+	// "sync/atomic" // No longer needed
 	"time"
 
 	// Use your actual module path
@@ -24,9 +24,8 @@ import (
 	"github.com/brensch/nemparquet/internal/db"
 	"github.com/brensch/nemparquet/internal/util"
 
-	// Needed for GetCompletionStatusBatch if kept in db package
 	"golang.org/x/net/html"
-	// "golang.org/x/sync/semaphore" // No longer needed for sequential
+	// Removed semaphore, atomic
 )
 
 // --- List of Realistic User Agents ---
@@ -44,7 +43,7 @@ func init() {
 }
 
 // Function to get a random user agent
-func getRandomUserAgent() string {
+func GetRandomUserAgent() string { // Exported function
 	if len(commonUserAgents) == 0 {
 		// Fallback if list is somehow empty
 		return "NEMParquetConverter/1.2 (Go-client)" // Increment version maybe
@@ -52,16 +51,18 @@ func getRandomUserAgent() string {
 	return commonUserAgents[rand.Intn(len(commonUserAgents))]
 }
 
-// DiscoverZipURLs performs only the discovery phase.
-func DiscoverZipURLs(ctx context.Context, cfg config.Config, logger *slog.Logger) ([]string, error) {
+// DiscoverZipURLs performs the discovery phase for a given list of feed URLs.
+// Returns a map of discovered ZipURL -> SourceFeedURL and any non-fatal discovery error.
+func DiscoverZipURLs(ctx context.Context, repos []string, logger *slog.Logger) (map[string]string, error) {
 	client := util.DefaultHTTPClient()
 	var discoveryErr error
-	allZipLinks := make(map[string]string) // Map absolute URL -> source feed URL
+	// Combine both feed URL lists for discovery
+	discoveredLinks := make(map[string]string) // Map absolute URL -> source feed URL
 	processedFeeds := 0
-	var discoveryMu sync.Mutex // Still useful if feed discovery itself was parallel (it's not currently)
+	var discoveryMu sync.Mutex // Protect map access
 
-	logger.Debug("Starting discovery across feed URLs", slog.Int("feed_count", len(cfg.FeedURLs)))
-	for _, baseURL := range cfg.FeedURLs {
+	logger.Debug("Starting discovery across feed URLs", slog.Int("feed_count", len(repos)))
+	for _, baseURL := range repos {
 		// Check for context cancellation before processing each feed
 		select {
 		case <-ctx.Done():
@@ -72,7 +73,7 @@ func DiscoverZipURLs(ctx context.Context, cfg config.Config, logger *slog.Logger
 		}
 
 		processedFeeds++
-		l := logger.With(slog.String("feed_url", baseURL), slog.Int("feed_num", processedFeeds), slog.Int("total_feeds", len(cfg.FeedURLs)))
+		l := logger.With(slog.String("feed_url", baseURL), slog.Int("feed_num", processedFeeds), slog.Int("total_feeds", len(repos)))
 		l.Debug("Checking feed for discovery")
 
 		base, err := url.Parse(baseURL)
@@ -88,7 +89,7 @@ func DiscoverZipURLs(ctx context.Context, cfg config.Config, logger *slog.Logger
 			continue
 		}
 		// Set a user agent for discovery requests too
-		req.Header.Set("User-Agent", getRandomUserAgent())
+		req.Header.Set("User-Agent", GetRandomUserAgent()) // Use exported function
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -103,7 +104,7 @@ func DiscoverZipURLs(ctx context.Context, cfg config.Config, logger *slog.Logger
 		if resp.StatusCode != http.StatusOK {
 			l.Warn("Skip: Bad status.", "status", resp.Status)
 			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("discover status %s: %s", resp.Status, baseURL))
-			continue
+			continue // Continue even if body read failed on non-200
 		}
 		if readErr != nil {
 			l.Warn("Skip: read body failed.", "error", readErr)
@@ -125,8 +126,8 @@ func DiscoverZipURLs(ctx context.Context, cfg config.Config, logger *slog.Logger
 			zipURLAbs, err := base.Parse(relativeLink)
 			if err == nil {
 				absURL := zipURLAbs.String()
-				if _, exists := allZipLinks[absURL]; !exists {
-					allZipLinks[absURL] = baseURL // Store source feed
+				if _, exists := discoveredLinks[absURL]; !exists {
+					discoveredLinks[absURL] = baseURL // Store source feed
 					newLinksFound++
 				}
 			} else {
@@ -134,135 +135,26 @@ func DiscoverZipURLs(ctx context.Context, cfg config.Config, logger *slog.Logger
 			}
 		}
 		discoveryMu.Unlock() // Unlock map access
-		l.Debug("Feed check complete", slog.Int("new_links", newLinksFound), slog.Int("total_unique_links", len(allZipLinks)))
+		l.Debug("Feed check complete", slog.Int("new_links", newLinksFound), slog.Int("total_unique_links", len(discoveredLinks)))
 	} // End feed discovery loop
 
-	discoveredURLs := make([]string, 0, len(allZipLinks))
-	for url := range allZipLinks {
-		discoveredURLs = append(discoveredURLs, url)
-	}
-	logger.Debug("Finished discovery phase.", slog.Int("total_unique_zips", len(discoveredURLs)))
-	return discoveredURLs, discoveryErr
+	logger.Debug("Finished discovery phase.", slog.Int("total_unique_zips", len(discoveredLinks)))
+	return discoveredLinks, discoveryErr
 }
 
-// DownloadArchives discovers zip URLs, checks DB, and downloads missing ones sequentially.
-func DownloadArchives(ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger, forceDownload bool) error {
-	var discoveryErr error // Keep track of discovery errors separately
-
-	// --- Phase 1: Discover all unique zip URLs ---
-	logger.Info("Starting Phase 1: Discovering ZIP files...")
-	allDiscoveredURLs, discoveryErr := DiscoverZipURLs(ctx, cfg, logger) // Call separated discovery function
-	if discoveryErr != nil {
-		logger.Error("Failed during discovery phase.", "error", discoveryErr)
-		// Decide whether to stop or continue based on severity
-	}
-	if ctx.Err() != nil { // Check context after discovery
-		return errors.Join(discoveryErr, ctx.Err())
-	}
-	archivesFound := len(allDiscoveredURLs)
-	if archivesFound == 0 {
-		logger.Info("Phase 1 Complete: No unique ZIP files found.")
-		return discoveryErr // Return discovery errors if any
-	}
-	logger.Info("Phase 1 Complete", slog.Int("total_unique_zips", archivesFound))
-
-	// --- Phase 1.5: Batch Check DB Status ---
-	logger.Info("Checking database for previously downloaded files...")
-	completedStatusMap, dbErr := db.GetCompletionStatusBatch(ctx, dbConn, allDiscoveredURLs, db.FileTypeZip, db.EventDownloadEnd)
-	if dbErr != nil {
-		logger.Error("Database check failed, attempting to download all.", "error", dbErr)
-		discoveryErr = errors.Join(discoveryErr, fmt.Errorf("db batch check: %w", dbErr)) // Combine errors
-		completedStatusMap = make(map[string]bool)                                        // Assume none completed if check fails
-	} else {
-		logger.Debug("Database check complete.", slog.Int("already_downloaded_count", len(completedStatusMap)))
-	}
-
-	// --- Phase 1.6: Filter URLs and Log Skip Summary ---
-	urlsToDownload := make([]string, 0, archivesFound)
-	skippedCount := 0
-	for _, zipURL := range allDiscoveredURLs { // Use the slice from DiscoverZipURLs
-		if _, found := completedStatusMap[zipURL]; found && !forceDownload {
-			skippedCount++
-		} else {
-			urlsToDownload = append(urlsToDownload, zipURL)
-		}
-	}
-	if skippedCount > 0 {
-		logger.Info("Skipping already downloaded files.", slog.Int("skipped_count", skippedCount), slog.Int("total_discovered", archivesFound))
-	}
-	if len(urlsToDownload) == 0 {
-		logger.Info("No new zip files require downloading.")
-		return discoveryErr // Return only discovery/db errors if any
-	}
-
-	// --- Phase 2: Download Sequentially (Filtered List) ---
-	logger.Info("Starting Phase 2: Downloading new/forced zips sequentially...", slog.Int("files_to_process", len(urlsToDownload)))
-
-	var finalErr error = discoveryErr // Start with potential discovery/db errors
-	processedZipCount := 0
-	errorCount := 0
-
-	// Simple sequential loop
-	for _, zipURL := range urlsToDownload {
-		// Check context cancellation before each download
-		select {
-		case <-ctx.Done():
-			logger.Warn("Download cancelled.")
-			finalErr = errors.Join(finalErr, ctx.Err())
-			return finalErr // Exit loop early
-		default:
-			// Continue with download
-		}
-
-		processedZipCount++
-		l := logger.With(
-			slog.String("zip_url", zipURL),
-			slog.Int("zip_num", processedZipCount),
-			slog.Int("total_to_process", len(urlsToDownload)),
-		)
-		l.Info("Processing zip file.")
-
-		// Call downloadSingleZipAndSave
-		// Source URL isn't strictly needed by downloadSingleZipAndSave itself, but good practice to have if available
-		sourceURL := "" // Default to empty if map lookup fails (shouldn't happen if discovered)
-		// if src, ok := allZipLinks[zipURL]; ok { sourceURL = src } // Get source URL if needed later
-
-		_, err := downloadSingleZipAndSave(ctx, cfg, dbConn, l, util.DefaultHTTPClient(), zipURL, sourceURL) // Ignore saved path return here
-		if err != nil {
-			// Error is already logged within downloadSingleZipAndSave
-			finalErr = errors.Join(finalErr, fmt.Errorf("zip %s: %w", zipURL, err))
-			errorCount++
-			// Optional: Introduce a small delay here *after* an error before proceeding?
-			// time.Sleep(500 * time.Millisecond)
-		} else {
-			l.Info("Successfully processed zip file.")
-		}
-
-		// Optional: Add a small delay between *all* downloads to be extra cautious?
-		// time.Sleep(100 * time.Millisecond)
-
-	} // End sequential loop
-
-	logger.Info("Phase 2 Complete: Finished processing all required zips.")
-	if errorCount > 0 {
-		logger.Warn("Download phase completed with errors", slog.Int("error_count", errorCount), "error", finalErr)
-	} else if finalErr == nil { // Check if only discovery/db errors occurred
-		logger.Info("Download phase completed successfully.")
-	}
-	return finalErr
-}
-
-// RunSequentialDownloads is used by the orchestrator to download a specific list sequentially
-// and feed paths to a channel.
+// RunSequentialDownloads iterates through URLs, downloads them sequentially,
+// and sends the *local path* of successfully downloaded files to the output channel.
+// This is called by the orchestrator.
 func RunSequentialDownloads(
 	ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger,
-	urlsToDownload []string, downloadedPathsChan chan<- string,
+	urlsToDownload []string, downloadedPathsChan chan<- string, // Takes list of URLs to download
+	urlToSourceMap map[string]string, // Need source URL for logging
 ) error {
 	client := util.DefaultHTTPClient()
 	var finalErr error
 	processedCount := 0
 
-	logger.Info("Sequential downloader started for orchestrator.", slog.Int("count", len(urlsToDownload)))
+	logger.Info("Sequential downloader started.", slog.Int("count", len(urlsToDownload)))
 
 	for _, zipURL := range urlsToDownload {
 		select {
@@ -282,12 +174,13 @@ func RunSequentialDownloads(
 		)
 		l.Info("Processing download.")
 
-		// Call downloadSingleZipAndSave
-		// Source URL isn't available here unless passed in, default to empty
-		savedPath, err := downloadSingleZipAndSave(ctx, cfg, dbConn, l, client, zipURL, "")
+		sourceURL := urlToSourceMap[zipURL] // Get source URL from map passed by orchestrator
+
+		// Call DownloadSingleZipAndSave (renamed from downloadSingleZipAndSave)
+		savedPath, err := DownloadSingleZipAndSave(ctx, cfg, dbConn, l, client, zipURL, sourceURL)
 
 		if err != nil {
-			l.Error("Failed to download zip", "error", err) // Error logged within downloadSingleZipAndSave too
+			l.Error("Failed to download zip", "error", err) // Error logged within DownloadSingleZipAndSave too
 			finalErr = errors.Join(finalErr, fmt.Errorf("download %s: %w", zipURL, err))
 			// Continue to the next file even if one fails
 		} else if savedPath != "" {
@@ -299,18 +192,23 @@ func RunSequentialDownloads(
 			case <-ctx.Done():
 				logger.Warn("Download sequence cancelled while sending path to processor.")
 				finalErr = errors.Join(finalErr, ctx.Err())
+				// Need to ensure channel is closed eventually if we exit here
+				// The defer close in the calling goroutine (orchestrator) handles this.
 				return finalErr // Exit loop if cancelled while sending
 			}
 		}
+		// Optional small delay between downloads
+		// time.Sleep(50 * time.Millisecond)
 	}
 
-	logger.Info("Sequential downloader finished processing all URLs for orchestrator.")
+	logger.Info("Sequential downloader finished processing all URLs.")
 	return finalErr
 }
 
-// downloadSingleZipAndSave handles downloading one zip and saving it.
+// DownloadSingleZipAndSave handles downloading one zip and saving it.
 // Returns the saved absolute path on success, or error on failure.
-func downloadSingleZipAndSave(ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger, client *http.Client, zipURL, sourceFeedURL string) (string, error) {
+// Logs events using the original zipURL as the filename key.
+func DownloadSingleZipAndSave(ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger, client *http.Client, zipURL, sourceFeedURL string) (string, error) {
 	startTime := time.Now()
 	zipFilename := filepath.Base(zipURL)
 	relativeOutputPath := filepath.Join(cfg.InputDir, zipFilename) // Relative path first
@@ -320,24 +218,26 @@ func downloadSingleZipAndSave(ctx context.Context, cfg config.Config, dbConn *sq
 	if absErr != nil {
 		pathErr := fmt.Errorf("failed to get absolute path for %s: %w", relativeOutputPath, absErr)
 		logger.Error("Cannot determine absolute output path.", "relative_path", relativeOutputPath, "error", pathErr)
+		// Log an event without a valid path? Maybe log with relative path?
 		db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventError, sourceFeedURL, relativeOutputPath, pathErr.Error(), "", nil)
 		return "", pathErr
 	}
 	l := logger.With(slog.String("output_path", outputZipPath)) // Add abs path to logger context
 
 	l.Info("Starting download.")
-	// Log start event with the absolute path
+	// Log start event with the absolute path in output_path, URL as filename
 	db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventDownloadStart, sourceFeedURL, outputZipPath, "", "", nil)
 
 	// Create request object
 	req, err := http.NewRequestWithContext(ctx, "GET", zipURL, nil)
 	if err != nil {
 		reqErr := fmt.Errorf("create request failed: %w", err)
+		// Log event with absolute path
 		db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventError, sourceFeedURL, outputZipPath, reqErr.Error(), "", nil)
 		logger.Error("Failed creating request.", "error", reqErr)
 		return "", reqErr
 	}
-	req.Header.Set("User-Agent", getRandomUserAgent())
+	req.Header.Set("User-Agent", GetRandomUserAgent()) // Use exported function
 	req.Header.Set("Accept", "application/zip,application/octet-stream,*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
@@ -360,15 +260,16 @@ func downloadSingleZipAndSave(ctx context.Context, cfg config.Config, dbConn *sq
 		} else {
 			logger.Error("Download failed.", "error", dlErr, slog.Duration("duration", downloadDuration.Round(time.Millisecond)))
 		}
-		return "", dlErr
+		return "", dlErr // Return the error
 	}
+	// --- End Error Handling ---
 
 	// --- Success Path ---
 	l.Debug("Download complete.", slog.Int("bytes", len(data)), slog.Duration("duration", downloadDuration.Round(time.Millisecond)))
 
 	// Save the downloaded data to disk (using absolute path)
 	err = os.WriteFile(outputZipPath, data, 0644)
-	saveDuration := time.Since(startTime)
+	saveDuration := time.Since(startTime) // Update duration to include save time
 	if err != nil {
 		saveErr := fmt.Errorf("failed to save zip file %s: %w", outputZipPath, err)
 		// Log event with absolute path

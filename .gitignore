@@ -26,3 +26,5 @@ go.work.sum
 
 input_csv/
 output_parquet/
+*.parquet
+*.zip
