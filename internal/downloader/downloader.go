@@ -240,9 +240,17 @@ func DownloadSingleZipAndSave(ctx context.Context, cfg config.Config, dbConn *sq
 	req.Header.Set("User-Agent", GetRandomUserAgent()) // Use exported function
 	req.Header.Set("Accept", "application/zip,application/octet-stream,*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
+	progressCallback := func(downloadedBytes int64, totalBytes int64) {
+		// Log progress every 100MB (logic is inside the progressReader now)
+		// Ensure logger passed here has the right context (it does via 'l')
+		if totalBytes > 0 {
+			l.Info("Download progress", slog.Int64("downloaded_mb", downloadedBytes/(1024*1024)), slog.Int64("total_mb", totalBytes/(1024*1024)), slog.Float64("percent", float64(downloadedBytes)*100.0/float64(totalBytes)))
+		} else {
+			l.Info("Download progress", slog.Int64("downloaded_mb", downloadedBytes/(1024*1024)))
+		}
+	}
 	// Download File content
-	data, err := util.DownloadFile(client, req)
+	data, err := util.DownloadFileWithProgress(client, req, progressCallback)
 	downloadDuration := time.Since(startTime)
 
 	// --- Error Handling ---

@@ -14,7 +14,7 @@ var DefaultFeedURLs = []string{
 // DefaultArchiveFeedURLs lists the NEMWEB "Archive" directories potentially containing zip files of zip files.
 // Can be overridden by the --archive-feed-url flag.
 var DefaultArchiveFeedURLs = []string{
-	"https://nemweb.com.au/Reports/Archive/FPPDAILY/",
+	// "https://nemweb.com.au/Reports/Archive/FPPDAILY/",
 	"https://nemweb.com.au/Reports/Archive/FPPRATES/",
 	"https://nemweb.com.au/Reports/Archive/FPPRUN/", // Contains historical FPP_RCR data
 	"https://nemweb.com.au/Reports/Archive/P5_Reports/",
