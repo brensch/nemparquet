@@ -5,7 +5,7 @@ go 1.24
 toolchain go1.24.2
 
 require (
-	github.com/lib/pq v1.10.4
+	github.com/lmittmann/tint v1.0.7
 	github.com/marcboeker/go-duckdb v1.8.5
 	github.com/spf13/cobra v1.9.1
 	github.com/xitongsys/parquet-go v1.6.2

@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"context" // Keep context import
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -12,15 +12,13 @@ import (
 	"strings"
 	"time"
 
-	// "time" // No longer needed directly here
-
 	// Use your actual module path
 	"github.com/brensch/nemparquet/internal/config"
 	"github.com/brensch/nemparquet/internal/db"
 
+	"github.com/lmittmann/tint"         // Import the tint handler
 	_ "github.com/marcboeker/go-duckdb" // DuckDB driver
 	"github.com/spf13/cobra"
-	// "github.com/spf13/pflag" // No longer explicitly needed if not using advanced pflag features
 )
 
 var (
@@ -67,52 +65,69 @@ Other commands allow inspecting data, running analysis separately, or viewing st
 		}
 
 		var logWriter io.Writer = os.Stderr // Default to stderr
+		logFileHandle := io.Closer(nil)     // Keep track of file handle if opened
+		isTerminal := false                 // Flag to check if output is a terminal
+
 		if logOutput != "" && strings.ToLower(logOutput) != "stderr" {
 			if strings.ToLower(logOutput) == "stdout" {
 				logWriter = os.Stdout
+				// Check if stdout is a terminal
+				if fileInfo, _ := os.Stdout.Stat(); (fileInfo.Mode() & os.ModeCharDevice) != 0 {
+					isTerminal = true
+				}
 			} else {
 				// Attempt to open file
-				// Use O_APPEND|O_CREATE|O_WRONLY for appending to log file
 				f, err := os.OpenFile(logOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 				if err != nil {
 					return fmt.Errorf("failed to open log file %s: %w", logOutput, err)
 				}
-				// Note: File handle 'f' is not explicitly closed here.
-				// For a CLI tool that exits, this is often acceptable as the OS cleans up.
-				// For long-running services, proper closure is essential.
 				logWriter = f
+				logFileHandle = f  // Store handle for potential closing later
+				isTerminal = false // File output is not a terminal
+			}
+		} else {
+			// Defaulting to stderr, check if it's a terminal
+			if fileInfo, _ := os.Stderr.Stat(); (fileInfo.Mode() & os.ModeCharDevice) != 0 {
+				isTerminal = true
 			}
 		}
 
-		opts := &slog.HandlerOptions{Level: level}
 		var handler slog.Handler
-		if logFormat == "json" {
-			handler = slog.NewJSONHandler(logWriter, opts)
+		logFormatLower := strings.ToLower(logFormat)
+
+		// *** Use tint handler for text format if output is a terminal ***
+		if logFormatLower == "text" {
+			handler = tint.NewHandler(logWriter, &tint.Options{
+				Level:      level,
+				TimeFormat: time.Kitchen, // Example time format
+				AddSource:  false,        // Disable source code location for cleaner logs
+				NoColor:    !isTerminal,  // Disable color if not writing to a terminal
+			})
+		} else if logFormatLower == "json" {
+			handler = slog.NewJSONHandler(logWriter, &slog.HandlerOptions{
+				Level:     level,
+				AddSource: true, // Optionally add source for JSON
+			})
 		} else {
-			handler = slog.NewTextHandler(logWriter, opts)
+			// Fallback to default text handler if format is unknown
+			handler = slog.NewTextHandler(logWriter, &slog.HandlerOptions{
+				Level:     level,
+				AddSource: false,
+			})
 		}
+
 		rootLogger = slog.New(handler)
-		slog.SetDefault(rootLogger) // Set for packages using global slog
-		rootLogger.Info("Logger initialized", "level", level.String(), "format", logFormat, "output", logOutput)
+		slog.SetDefault(rootLogger)
+		rootLogger.Info("Logger initialized", "level", level.String(), "format", logFormat, "output", logOutput, "colors_enabled", isTerminal && logFormatLower == "text")
 
 		// --- 2. Load/Validate Config (from flags) ---
-		// More sophisticated apps would use Viper or similar here, potentially loading from cfgFile
-		appConfig = config.Config{
-			InputDir:       inputDir,
-			OutputDir:      outputDir,
-			DbPath:         dbPath,
-			NumWorkers:     workers,
-			FeedURLs:       feedUrls,
-			SchemaRowLimit: config.DefaultSchemaRowLimit, // Consider making this a flag too
+		appConfig = config.Config{ /* ... */
+			InputDir: inputDir, OutputDir: outputDir, DbPath: dbPath, NumWorkers: workers, FeedURLs: feedUrls, SchemaRowLimit: config.DefaultSchemaRowLimit,
 		}
 		rootLogger.Debug("Configuration loaded", slog.Any("config", appConfig))
-
-		// Validate essential paths
 		if appConfig.InputDir == "" || appConfig.OutputDir == "" || appConfig.DbPath == "" {
 			return fmt.Errorf("--input-dir, --output-dir, and --db-path flags are required")
 		}
-
-		// Ensure directories exist
 		for _, d := range []string{appConfig.InputDir, appConfig.OutputDir} {
 			if err := os.MkdirAll(d, 0o755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", d, err)
@@ -132,55 +147,58 @@ Other commands allow inspecting data, running analysis separately, or viewing st
 		if err != nil {
 			return fmt.Errorf("failed to open duckdb database (%s): %w", appConfig.DbPath, err)
 		}
-		// Ping to ensure connection is valid immediately
-		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Add timeout to ping
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err = dbConn.PingContext(pingCtx); err != nil {
-			dbConn.Close() // Close if ping fails
+			dbConn.Close()
 			return fmt.Errorf("failed to ping duckdb database (%s): %w", appConfig.DbPath, err)
 		}
 		rootLogger.Info("DuckDB connection successful.")
-
-		// Initialize DB Schema
 		if err := db.InitializeSchema(dbConn); err != nil {
 			dbConn.Close()
 			return fmt.Errorf("failed to initialize database schema: %w", err)
 		}
 		rootLogger.Info("Database schema initialized successfully.")
 
-		return nil // Return nil on success
-	},
-	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-		// Close DB connection if it was opened
-		if dbConn != nil {
-			rootLogger.Info("Closing DuckDB connection.")
-			if err := dbConn.Close(); err != nil {
-				// Log error but don't necessarily fail the command exit status
-				rootLogger.Error("Failed to close DuckDB connection cleanly", "error", err)
-				// return err // Optionally return error
+		// Handle closing the log file if it was opened (best effort in PostRun)
+		// Note: This relies on the logFileHandle variable being accessible in PostRun.
+		// A cleaner way might involve storing it in the command's context or a global registry.
+		cmd.PersistentPostRunE = func(cmd *cobra.Command, args []string) error {
+			if dbConn != nil {
+				rootLogger.Info("Closing DuckDB connection.")
+				if err := dbConn.Close(); err != nil {
+					rootLogger.Error("Failed to close DuckDB connection cleanly", "error", err)
+				}
 			}
+			if logFileHandle != nil {
+				rootLogger.Debug("Closing log file handle.") // Log before closing
+				if err := logFileHandle.Close(); err != nil {
+					// Log error closing file, but don't fail command exit
+					fmt.Fprintf(os.Stderr, "Error closing log file: %v\n", err)
+				}
+			}
+			return nil
 		}
-		// Close log file? Still tricky with Cobra's lifecycle.
+
 		return nil
 	},
+	// Remove PersistentPostRunE from here if defined within PersistentPreRunE
+	// PersistentPostRunE: func(cmd *cobra.Command, args []string) error { ... },
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	// Add child commands here
-	rootCmd.AddCommand(runCmd)     // Combined workflow command
-	rootCmd.AddCommand(inspectCmd) // Inspect parquet files
-	rootCmd.AddCommand(analyseCmd) // Run FPP analysis
-	rootCmd.AddCommand(stateCmd)   // View DB state log
+	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(inspectCmd)
+	rootCmd.AddCommand(analyseCmd)
+	rootCmd.AddCommand(stateCmd)
 
 	err := rootCmd.Execute()
 	if err != nil {
-		// Cobra usually prints the error, but log it just in case
 		if rootLogger != nil {
 			rootLogger.Error("Command execution failed", "error", err)
 		} else {
-			// Fallback if logger wasn't initialized
 			fmt.Fprintf(os.Stderr, "Command execution failed: %v\n", err)
 		}
 		os.Exit(1)
@@ -188,45 +206,26 @@ func Execute() {
 }
 
 func init() {
-	// Define persistent flags available to root and all subcommands
-	// Use PersistentFlags() for flags common to all commands
+	// Define persistent flags
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.nemparquet.yaml) (Not implemented yet)")
 	rootCmd.PersistentFlags().StringVarP(&inputDir, "input-dir", "i", "./input_csv", "Directory for downloaded zip files")
 	rootCmd.PersistentFlags().StringVarP(&outputDir, "output-dir", "o", "./output_parquet", "Directory for generated Parquet files")
 	rootCmd.PersistentFlags().StringVarP(&dbPath, "db-path", "d", "./nemparquet_state.duckdb", "Path to DuckDB state database file (:memory: for in-memory)")
 	rootCmd.PersistentFlags().IntVarP(&workers, "workers", "w", runtime.NumCPU(), "Number of concurrent workers for processing phase")
-	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log output format (text or json)")
+	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log output format (text or json)") // Keep text as default
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&logOutput, "log-output", "stderr", "Log output destination (stderr, stdout, or file path)")
 	rootCmd.PersistentFlags().StringSliceVar(&feedUrls, "feed-url", config.DefaultFeedURLs, "Feed URLs to fetch discovery info from (can specify multiple)")
 
-	// Add version flag (handled automatically by Cobra if Version field is set)
-	rootCmd.Version = "0.2.0" // Update your version
-	// rootCmd.Flags().BoolP("version", "v", false, "Print version information and exit") // Cobra adds this if Version is set
-
-	// Bind persistent flags to viper config if using viper later
-	// Ex: cobra.OnInitialize(initConfig)
-	// func initConfig() { viper.BindPFlag(...) }
+	rootCmd.Version = "0.2.2" // Incremented version
 }
 
-// Helper to get logger (could use context propagation instead)
+// Helper functions (Unchanged)
 func getLogger() *slog.Logger {
 	if rootLogger == nil {
-		// Fallback if PersistentPreRun hasn't run (e.g., during tests or init failures)
-		// Consider returning a disabled logger or panicking based on requirements
-		return slog.New(slog.NewTextHandler(io.Discard, nil)) // Discard logs if not initialized
+		return slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return rootLogger
 }
-
-// Helper to get DB connection (could use context propagation instead)
-func getDB() *sql.DB {
-	// Add nil check? Should always be populated after PersistentPreRunE succeeds.
-	return dbConn
-}
-
-// Helper to get Config (could use context propagation instead)
-func getConfig() config.Config {
-	// Add validation check? Should always be populated after PersistentPreRunE succeeds.
-	return appConfig
-}
+func getDB() *sql.DB           { return dbConn }
+func getConfig() config.Config { return appConfig }
