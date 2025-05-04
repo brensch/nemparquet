@@ -3,8 +3,9 @@ package processor
 import (
 	"archive/zip"
 	"context"
-	"database/sql"        // Keep for checking results, passing pool
-	"database/sql/driver" // Required for driver.Conn and driver.Value
+
+	// "database/sql" // No longer needed directly in this file
+	"database/sql/driver" // Still needed for driver.Value
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -15,15 +16,42 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
+	"sync" // <<< Added for Mutex in global registry
 
+	// Keep for potential future use or logging
 	// Use your actual module path
 	"github.com/brensch/nemparquet/internal/config"
-	"github.com/brensch/nemparquet/internal/db" // Keep for logging events
+	// "github.com/brensch/nemparquet/internal/db" // No direct DB interaction here
 	"github.com/brensch/nemparquet/internal/util"
+	// "github.com/marcboeker/go-duckdb" // No direct DuckDB interaction here
+)
 
-	"github.com/marcboeker/go-duckdb" // Import DuckDB driver connector etc.
+// WriteOperation defines the data sent from parser to writer goroutine
+type WriteOperation struct {
+	TableName    string         // Target table name (sanitized)
+	Data         []driver.Value // Row data ready for appending
+	LineNumber   int64          // Original line number for logging
+	IsFirstChunk bool           // Flag if this is the first chunk for a new table/section (for schema inference)
+	Headers      []string       // Original headers (sent only with first chunk)
+	ColumnNames  []string       // Sanitized column names (sent only with first chunk)
+	DuckdbTypes  []string       // Inferred DuckDB types (sent only with first chunk)
+	IsDateColumn []bool         // Date column flags (sent only with first chunk)
+}
+
+// --- Global Schema Info Registry ---
+// Tracks tables for which the schema has been inferred and sent *in this run*.
+// Stores the inferred types to avoid re-inference.
+type SchemaInfo struct {
+	DuckdbTypes  []string
+	IsDateColumn []bool
+	ColumnNames  []string // Store sanitized names too
+	Headers      []string // Store original headers
+	Sent         bool     // Has the first chunk been sent?
+}
+
+var (
+	schemaRegistry      = make(map[string]*SchemaInfo)
+	schemaRegistryMutex sync.Mutex // <<< CORRECTLY DECLARED MUTEX HERE
 )
 
 // Regex for sanitizing SQL identifiers
@@ -41,213 +69,125 @@ func sanitizeSQLIdentifier(name string) string {
 	return strings.ToLower(sanitized)
 }
 
-// StartProcessorWorkers launches goroutines that process zip files.
-// Each worker uses the main pool for checks but creates short-lived
-// connections/appenders per CSV section.
-func StartProcessorWorkers(
-	ctx context.Context, cfg config.Config, dbConnPool *sql.DB, logger *slog.Logger, // Pass Pool
-	numWorkers int, pathsChan <-chan string,
-	wg *sync.WaitGroup, errorsMap *sync.Map,
-	forceProcess bool,
-) {
-	logger.Info("Starting processor workers (DuckDB backend, connection per section)", slog.Int("count", numWorkers))
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			l := logger.With(slog.Int("worker_id", workerID))
-			l.Debug("Processing worker started")
-
-			// No persistent worker connection needed here.
-
-			for zipFilePath := range pathsChan {
-				jobCtx, cancelJob := context.WithCancel(ctx) // Context per job
-				jobLogger := l.With(slog.String("zip_file_path", zipFilePath))
-
-				// --- Perform DB checks using the main pool ---
-				absZipFilePath, pathErr := filepath.Abs(zipFilePath)
-				if pathErr != nil {
-					jobLogger.Error("Failed get absolute path, skipping.", "error", pathErr)
-					errorsMap.Store(zipFilePath, pathErr)
-					cancelJob()
-					continue
-				}
-				identifier, fileType, foundID, dbErr := db.GetIdentifierForOutputPath(jobCtx, dbConnPool, absZipFilePath)
-				if dbErr != nil {
-					jobLogger.Error("DB error finding identifier, skipping.", "error", dbErr)
-					errorsMap.Store(zipFilePath, dbErr)
-					cancelJob()
-					continue
-				}
-				if !foundID {
-					jobLogger.Warn("Could not find identifier in DB, skipping.", slog.String("abs_path", absZipFilePath))
-					cancelJob()
-					continue
-				}
-				jobLogger = jobLogger.With(slog.String("identifier", identifier), slog.String("file_type", fileType))
-
-				// --- Check if already processed ---
-				processCompleted := false
-				if !forceProcess {
-					var checkErr error
-					processCompleted, checkErr = db.HasEventOccurred(jobCtx, dbConnPool, identifier, fileType, db.EventProcessEnd)
-					if checkErr != nil {
-						jobLogger.Warn("Failed check DB state, proceeding.", "error", checkErr)
-						db.LogFileEvent(ctx, dbConnPool, identifier, fileType, db.EventError, "", "", fmt.Sprintf("db check process failed: %v", checkErr), "", nil)
-						processCompleted = false
-					}
-				} else {
-					jobLogger.Info("Force process enabled, skipping DB completion check.")
-				}
-				if processCompleted {
-					jobLogger.Info("Skipping processing, already completed.", slog.String("identifier", identifier))
-					db.LogFileEvent(ctx, dbConnPool, identifier, fileType, db.EventSkipProcess, "", "", "Already processed", "", nil)
-					cancelJob()
-					continue
-				}
-
-				// --- Proceed with Processing ---
-				jobLogger.Info("Starting processing (writing to DuckDB per section).")
-				startTime := time.Now()
-				db.LogFileEvent(ctx, dbConnPool, identifier, fileType, db.EventProcessStart, "", "", "", "", nil) // Log start using pool
-
-				// Pass the main DB pool (for logging) and config to the processor function
-				// The processor will handle connections internally per section.
-				processErr := processSingleZipArchive(jobCtx, cfg, jobLogger, dbConnPool, zipFilePath, identifier, fileType)
-				duration := time.Since(startTime)
-
-				if processErr != nil {
-					if errors.Is(processErr, context.Canceled) || errors.Is(processErr, context.DeadlineExceeded) {
-						jobLogger.Warn("Processing cancelled.", "cause", processErr)
-					} else {
-						jobLogger.Error("Failed to process zip archive", "error", processErr, slog.Duration("duration", duration.Round(time.Millisecond)))
-						db.LogFileEvent(ctx, dbConnPool, identifier, fileType, db.EventError, "", "", processErr.Error(), "", &duration)
-						errorsMap.Store(zipFilePath, processErr)
-					}
-				} else {
-					jobLogger.Info("Processing successful (data ingested to DuckDB).", slog.Duration("duration", duration.Round(time.Millisecond)))
-					db.LogFileEvent(ctx, dbConnPool, identifier, fileType, db.EventProcessEnd, "", "", "Data ingested to DuckDB", "", &duration)
-				}
-				cancelJob() // Cancel job context
-			} // End job loop
-			l.Debug("Processing worker finished")
-		}(i)
-	}
-}
-
-// processSingleZipArchive processes one zip file. It passes the pool down.
-func processSingleZipArchive(
-	ctx context.Context, cfg config.Config, logger *slog.Logger,
-	dbPool *sql.DB, // <<< Pass pool
-	zipFilePath string, identifier string, fileType string,
+// ParseZipArchive processes one zip file, parsing CSVs and sending data to the writer channel.
+// It no longer interacts directly with the database.
+func ParseZipArchive(
+	ctx context.Context, // Job-specific context
+	cfg config.Config,
+	logger *slog.Logger,
+	writerChan chan<- WriteOperation, // <<< Channel to send data to writer
+	zipFilePath string,
+	identifier string, // Keep for potential logging context ?
+	fileType string, // Keep for potential logging context ?
 ) error {
 	l := logger
-	l.Debug("Opening zip archive from disk.")
+	l.Debug("Opening zip archive for parsing.", slog.String("path", zipFilePath))
 	zr, err := zip.OpenReader(zipFilePath)
 	if err != nil {
-		l.Error("Failed to open zip archive", "error", err)
+		l.Error("Parser failed to open zip archive", "error", err)
 		return fmt.Errorf("zip.OpenReader %s: %w", zipFilePath, err)
 	}
 	defer zr.Close()
 
 	var processingErrors error
 	csvFoundCount := 0
-	zipBaseName := strings.TrimSuffix(filepath.Base(zipFilePath), filepath.Ext(zipFilePath))
+	zipBaseName := strings.TrimSuffix(filepath.Base(zipFilePath), filepath.Ext(zipFilePath)) // Keep for logging
 
 	for _, f := range zr.File {
+		// Check for cancellation before processing each file within the zip
 		select {
 		case <-ctx.Done():
-			l.Warn("Processing cancelled within zip.", "cause", ctx.Err())
-			return errors.Join(processingErrors, ctx.Err())
-		default:
+			l.Warn("Parsing cancelled within zip.", "cause", ctx.Err())
+			return errors.Join(processingErrors, ctx.Err()) // Return context error
+
+		default: // Continue processing this file
 		}
+
+		// Filter for CSV files only, ignore directories
 		if f.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(f.Name), ".csv") {
 			continue
 		}
+
 		csvFoundCount++
 		csvBaseName := filepath.Base(f.Name)
 		csvLogger := l.With(slog.String("internal_csv", csvBaseName))
-		csvLogger.Debug("Found CSV inside archive, starting stream processing.")
+		csvLogger.Debug("Found CSV inside archive, starting stream parsing (sending to writer).")
 
+		// Open the CSV file stream within the zip
 		rc, err := f.Open()
 		if err != nil {
-			csvLogger.Error("Failed to open internal CSV file.", "error", err)
+			csvLogger.Error("Parser failed to open internal CSV file.", "error", err)
 			processingErrors = errors.Join(processingErrors, fmt.Errorf("open internal %s: %w", csvBaseName, err))
 			continue
 		}
-		defer rc.Close()
+		defer rc.Close() // Ensure reader closed
 
 		streamCtx, cancelStream := context.WithCancel(ctx)
-		// Pass the pool down to the stream processor
-		streamErr := processCSVStream(streamCtx, cfg, csvLogger, dbPool, rc, zipBaseName) // <<< Pass pool
+		streamErr := processCSVStream(streamCtx, cfg, csvLogger, writerChan, rc, zipBaseName)
 		cancelStream()
 
 		if streamErr != nil {
 			if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
 				if errors.Is(streamErr, ctx.Err()) {
-					csvLogger.Warn("CSV stream processing cancelled by parent job.", "cause", streamErr)
+					csvLogger.Warn("CSV stream parsing cancelled by parent job.", "cause", streamErr)
 				} else {
-					csvLogger.Warn("CSV stream processing cancelled.", "cause", streamErr)
+					csvLogger.Warn("CSV stream parsing cancelled.", "cause", streamErr)
 				}
 				processingErrors = errors.Join(processingErrors, streamErr)
-				return processingErrors // Stop processing zip
+				return processingErrors // Stop processing this zip entirely if cancelled
 			}
-			csvLogger.Error("Failed to process internal CSV stream.", "error", streamErr)
+			csvLogger.Error("Parser failed to process internal CSV stream.", "error", streamErr)
 			processingErrors = errors.Join(processingErrors, fmt.Errorf("process stream %s: %w", csvBaseName, streamErr))
 		} else {
-			csvLogger.Debug("Successfully processed CSV stream.")
+			csvLogger.Debug("Parser successfully finished processing CSV stream.")
 		}
 	} // End loop files in zip
 
 	if csvFoundCount == 0 {
-		l.Info("No CSV files found within this zip archive.")
+		l.Info("Parser found no CSV files within this zip archive.")
 	} else if processingErrors != nil {
 		if errors.Is(processingErrors, context.Canceled) || errors.Is(processingErrors, context.DeadlineExceeded) {
-			l.Warn("Finished processing zip with cancellation.", "error", processingErrors)
+			l.Warn("Parser finished processing zip with cancellation.", "error", processingErrors)
 		} else {
-			l.Warn("Finished processing zip, but encountered errors.", "error", processingErrors)
+			l.Warn("Parser finished processing zip, but encountered errors during parsing/sending.", "error", processingErrors)
 		}
 	} else {
-		l.Debug("Finished processing all CSVs found in zip archive.")
+		l.Debug("Parser finished processing all CSVs found in zip archive.")
 	}
 	return processingErrors
 }
 
 // --- Section Processing Logic ---
 
-// csvSection holds state for processing one I..D..D section into DuckDB
+// csvSection holds state for PARSING one I..D..D section
 type csvSection struct {
 	Cfg            config.Config
 	Logger         *slog.Logger
-	DBPool         *sql.DB // <<< Keep pool for logging/checks if needed later
-	TableName      string
-	Headers        []string
-	DuckdbTypes    []string
-	ColumnNames    []string
-	IsDateColumn   []bool
-	SchemaInferred bool
-	RowsChecked    int
-	// Section-specific connection and appender:
-	sectionConn     driver.Conn      // <<< Connection for this section
-	appender        *duckdb.Appender // <<< Appender for this section
-	AppenderCreated bool
-	headerMap       map[string]int
-	columnIndexMap  map[int]string
+	WriterChan     chan<- WriteOperation // Channel to send data
+	TableName      string                // Sanitized table name
+	Headers        []string              // Original headers
+	ColumnNames    []string              // Sanitized column names
+	DuckdbTypes    []string              // Inferred DuckDB types (set once globally, copied locally)
+	IsDateColumn   []bool                // Flags for date columns (set once globally, copied locally)
+	SchemaKnown    bool                  // Flag: schema known *globally*?
+	headerMap      map[string]int        // Map header name to index
+	columnIndexMap map[int]string        // Map column index to DuckDB type name
+	// firstChunkSent is now handled globally by the registry
 }
 
-// newCSVSection initializes a section processor. Accepts the main pool.
+// newCSVSection initializes a section processor for parsing.
 func newCSVSection(
 	ctx context.Context, cfg config.Config, logger *slog.Logger,
-	dbPool *sql.DB, // <<< Accept Pool
+	writerChan chan<- WriteOperation, // <<< Pass writer channel
 	comp, ver string, headers []string,
 ) (*csvSection, error) {
 	tableName := sanitizeSQLIdentifier(fmt.Sprintf("%s_v%s", comp, ver))
 	s := &csvSection{
-		Cfg: cfg, Logger: logger.With(slog.String("table", tableName)), DBPool: dbPool, // Store Pool
-		TableName: tableName, Headers: headers, DuckdbTypes: make([]string, len(headers)),
+		Cfg: cfg, Logger: logger.With(slog.String("table", tableName)), WriterChan: writerChan,
+		TableName: tableName, Headers: headers, DuckdbTypes: make([]string, len(headers)), // Allocate slices
 		ColumnNames: make([]string, len(headers)), IsDateColumn: make([]bool, len(headers)),
 		headerMap: make(map[string]int, len(headers)), columnIndexMap: make(map[int]string, len(headers)),
-		// sectionConn and appender initialized later in inferSchemaAndEnsureTable
+		SchemaKnown: false, // Assume schema not known globally yet
 	}
 	for i, h := range headers { // Sanitize column names
 		colName := sanitizeSQLIdentifier(h)
@@ -262,102 +202,101 @@ func newCSVSection(
 		s.ColumnNames[i] = colName
 		s.headerMap[colName] = i
 	}
-	s.Logger.Debug("New CSV section initialized.")
+	s.Logger.Debug("New CSV section parser initialized.")
 	return s, nil
 }
 
-// inferSchemaAndEnsureTable infers schema, creates connection, creates table, and initializes appender for the section.
-func (s *csvSection) inferSchemaAndEnsureTable(ctx context.Context, values []string) error {
-	s.Logger.Debug("Inferring schema, creating section connection, ensuring table, creating appender.")
+// inferAndRegisterSchema infers schema based on a single data row,
+// stores it in the global registry if not already present, and sets local types.
+func (s *csvSection) inferAndRegisterSchema(values []string) error {
+	s.Logger.Debug("Attempting to infer and register schema globally.")
 
-	// --- Schema Inference (Data Only) ---
-	colDefs := make([]string, len(s.Headers))
+	// --- Final Conservative Schema Inference (Data Only) ---
+	inferredTypes := make([]string, len(s.Headers))
+	inferredDateFlags := make([]bool, len(s.Headers))
 	for i := range s.Headers {
 		val := values[i]
-		sanitizedColName := s.ColumnNames[i]
 		duckdbType := "VARCHAR"
 		isDate := false
 		if val != "" {
 			if util.IsNEMDateTime(val) {
 				duckdbType = "BIGINT"
 				isDate = true
-			} else if _, pErr := strconv.ParseFloat(val, 64); pErr == nil {
-				if _, intErr := strconv.ParseInt(val, 10, 64); intErr == nil {
-					duckdbType = "BIGINT"
-				} else {
-					duckdbType = "DOUBLE"
-				}
-			} else if _, pErr := strconv.ParseInt(val, 10, 64); pErr == nil {
-				duckdbType = "BIGINT"
 			} else {
 				lcValue := strings.ToLower(val)
 				if lcValue == "true" || lcValue == "false" {
 					duckdbType = "BOOLEAN"
+				} else {
+					_, floatErr := strconv.ParseFloat(val, 64)
+					if floatErr == nil {
+						_, intErr := strconv.ParseInt(val, 10, 64)
+						if intErr == nil {
+							duckdbType = "VARCHAR"
+						} else {
+							duckdbType = "DOUBLE"
+						}
+					} else {
+						_, intErr := strconv.ParseInt(val, 10, 64)
+						if intErr == nil {
+							duckdbType = "BIGINT"
+						}
+					}
 				}
 			}
 		}
-		s.DuckdbTypes[i] = duckdbType
-		s.IsDateColumn[i] = isDate
-		s.columnIndexMap[i] = duckdbType
-		colDefs[i] = fmt.Sprintf(`"%s" %s`, sanitizedColName, duckdbType)
+		inferredTypes[i] = duckdbType
+		inferredDateFlags[i] = isDate
 	}
-	s.Logger.Debug("Inferred DuckDB schema types (Data Only)", slog.Any("types", s.DuckdbTypes))
-	// --- End Schema Inference ---
+	s.Logger.Debug("Locally inferred DuckDB schema types", slog.Any("types", inferredTypes))
+	// --- End Final Conservative Schema Inference ---
 
-	// --- Create Connection for this Section ---
-	connector, err := duckdb.NewConnector(s.Cfg.DbPath, nil)
-	if err != nil {
-		s.Logger.Error("Failed to create DuckDB connector for section", "error", err)
-		return fmt.Errorf("create connector section %s: %w", s.TableName, err)
+	// --- Register Schema Globally (Mutex Guarded) ---
+	schemaRegistryMutex.Lock() // <<< Lock before checking/creating
+	existingInfo, exists := schemaRegistry[s.TableName]
+	if !exists {
+		// Schema not registered yet, store this inference result globally
+		s.Logger.Info("Registering schema globally.", slog.String("table", s.TableName))
+		schemaRegistry[s.TableName] = &SchemaInfo{
+			DuckdbTypes:  inferredTypes,
+			IsDateColumn: inferredDateFlags,
+			ColumnNames:  s.ColumnNames, // Store sanitized names globally too
+			Headers:      s.Headers,     // Store original headers globally
+			Sent:         false,         // Mark that schema is known, but first chunk not yet sent
+		}
+		// Use the newly inferred types for this section instance
+		s.DuckdbTypes = inferredTypes
+		s.IsDateColumn = inferredDateFlags
+		for i, dt := range s.DuckdbTypes {
+			s.columnIndexMap[i] = dt
+		} // Update local map
+		s.SchemaKnown = true
+	} else {
+		// Schema already registered globally, use the globally stored types
+		s.Logger.Debug("Schema already registered globally, using stored types.", slog.String("table", s.TableName))
+		s.DuckdbTypes = existingInfo.DuckdbTypes
+		s.IsDateColumn = existingInfo.IsDateColumn
+		// Ensure local column names match global ones (should always be same for same table)
+		if !reflect.DeepEqual(s.ColumnNames, existingInfo.ColumnNames) {
+			s.Logger.Warn("Mismatch between local and global column names for table! Using global.", slog.Any("local", s.ColumnNames), slog.Any("global", existingInfo.ColumnNames))
+			s.ColumnNames = existingInfo.ColumnNames // Prioritize global
+		}
+		for i, dt := range s.DuckdbTypes {
+			s.columnIndexMap[i] = dt
+		} // Update local map
+		s.SchemaKnown = true
 	}
-	s.sectionConn, err = connector.Connect(ctx) // Use passed context
-	if err != nil {
-		s.Logger.Error("Failed to connect via DuckDB connector for section", "error", err)
-		return fmt.Errorf("connect section %s: %w", s.TableName, err)
-	}
-	s.Logger.Debug("Created dedicated connection for section.", slog.String("table", s.TableName))
-	// --- End Create Connection ---
+	schemaRegistryMutex.Unlock() // <<< Unlock AFTER successful creation/retrieval and registration
+	// --- End Register Schema Globally ---
 
-	// --- Create Table using the section's connection ---
-	createTableSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (%s);`, s.TableName, strings.Join(colDefs, ", "))
-	s.Logger.Debug("Executing CREATE TABLE IF NOT EXISTS using section connection.", slog.String("sql", createTableSQL))
-	stmt, prepErr := s.sectionConn.Prepare(createTableSQL)
-	if prepErr != nil {
-		s.Logger.Error("Failed to prepare CREATE TABLE statement", "error", prepErr)
-		s.sectionConn.Close()
-		return fmt.Errorf("prepare CREATE TABLE %s: %w", s.TableName, prepErr)
-	} // Close conn on error
-	_, execErr := stmt.Exec(nil)
-	closeErr := stmt.Close()
-	if execErr != nil {
-		s.Logger.Error("Failed to execute CREATE TABLE IF NOT EXISTS", "error", execErr)
-		s.sectionConn.Close()
-		return fmt.Errorf("exec CREATE TABLE %s: %w", s.TableName, execErr)
-	} // Close conn on error
-	if closeErr != nil {
-		s.Logger.Warn("Failed to close CREATE TABLE statement", "error", closeErr)
-	}
-	s.Logger.Info("Table ensured.", slog.String("table", s.TableName))
-	// --- End Create Table ---
-
-	// --- Initialize DuckDB Appender using the section's connection ---
-	var appenderErr error
-	s.appender, appenderErr = duckdb.NewAppenderFromConn(s.sectionConn, "", s.TableName)
-	if appenderErr != nil {
-		s.Logger.Error("Failed to create DuckDB appender from section connection", "error", appenderErr)
-		s.sectionConn.Close()
-		return fmt.Errorf("create appender section %s: %w", s.TableName, appenderErr)
-	} // Close conn on error
-	s.AppenderCreated = true
-	s.Logger.Debug("DuckDB appender created using section connection.")
-	s.SchemaInferred = true
 	return nil
 }
 
-// appendRow prepares data and appends it using the section's DuckDB Appender.
-func (s *csvSection) appendRow(record []string, lineNumber int64) error {
-	if !s.SchemaInferred || !s.AppenderCreated || s.appender == nil {
-		return errors.New("cannot append row: section schema/appender not initialized")
+// prepareAndSendData prepares data row and sends it via the channel.
+// It now checks the global registry to decide if schema info needs to be sent.
+func (s *csvSection) prepareAndSendData(ctx context.Context, record []string, lineNumber int64) error {
+	// Schema must be known (either inferred now or previously globally)
+	if !s.SchemaKnown {
+		return errors.New("cannot prepare row: schema not known")
 	}
 	numExpectedFields := len(s.Headers)
 	// Pad/truncate record
@@ -375,6 +314,7 @@ func (s *csvSection) appendRow(record []string, lineNumber int64) error {
 	rowArgs := make([]driver.Value, numExpectedFields)
 	var conversionErrors error
 	for j := 0; j < numExpectedFields; j++ {
+		// Use the locally set (potentially globally derived) types for conversion
 		valueStr := record[j]
 		targetType := s.DuckdbTypes[j]
 		isDate := s.IsDateColumn[j]
@@ -423,6 +363,7 @@ func (s *csvSection) appendRow(record []string, lineNumber int64) error {
 			case "VARCHAR":
 				finalValue = valueStr
 				convErr = nil
+
 			default:
 				convErr = fmt.Errorf("col '%s': unhandled target type '%s'", s.Headers[j], targetType)
 				finalValue = nil
@@ -435,72 +376,60 @@ func (s *csvSection) appendRow(record []string, lineNumber int64) error {
 		rowArgs[j] = finalValue
 	} // End loop columns
 	if conversionErrors != nil {
-		s.Logger.Warn("Row contains conversion errors, skipping append.", "line", lineNumber, "errors", conversionErrors)
+		s.Logger.Warn("Row contains conversion errors, skipping send.", "line", lineNumber, "errors", conversionErrors)
 		return conversionErrors
 	}
 
-	// +++ DEBUG LOGGING +++
-	if s.Logger.Enabled(context.Background(), slog.LevelDebug) {
-		logAttrs := make([]slog.Attr, 0, numExpectedFields*3+1)
-		logAttrs = append(logAttrs, slog.Int64("line", lineNumber))
-		for k := 0; k < numExpectedFields; k++ {
-			colLogName := fmt.Sprintf("col_%d_%s", k, s.ColumnNames[k])
-			logAttrs = append(logAttrs, slog.Any(colLogName+"_val", rowArgs[k]))
-			var goType string
-			if rowArgs[k] == nil {
-				goType = "<nil>"
-			} else {
-				goType = reflect.TypeOf(rowArgs[k]).String()
-			}
-			logAttrs = append(logAttrs, slog.String(colLogName+"_goType", goType))
-			logAttrs = append(logAttrs, slog.String(colLogName+"_duckdbType", s.DuckdbTypes[k]))
-		}
-		s.Logger.LogAttrs(context.Background(), slog.LevelDebug, "Executing AppendRow with data", logAttrs...)
+	// --- Prepare WriteOperation ---
+	op := WriteOperation{
+		TableName:  s.TableName,
+		Data:       rowArgs,
+		LineNumber: lineNumber,
 	}
+
+	// --- Check Global Registry (Mutex Guarded) ---
+	// Decide if this specific send operation should include the schema details
+	schemaRegistryMutex.Lock() // <<< Lock before accessing registry
+	globalInfo, exists := schemaRegistry[s.TableName]
+	// Should always exist if s.SchemaKnown is true, but check defensively
+	if exists && !globalInfo.Sent {
+		op.IsFirstChunk = true
+		// Use the globally stored schema info for consistency
+		op.Headers = globalInfo.Headers
+		op.ColumnNames = globalInfo.ColumnNames
+		op.DuckdbTypes = globalInfo.DuckdbTypes
+		op.IsDateColumn = globalInfo.IsDateColumn
+		globalInfo.Sent = true // Mark as sent globally
+		s.Logger.Debug("Sending first chunk with schema info (Globally)", slog.Int64("line", lineNumber))
+	} else {
+		op.IsFirstChunk = false // Schema already sent by some worker
+		// s.Logger.Debug("Skipping schema info, already sent globally", slog.Int64("line", lineNumber))
+	}
+	schemaRegistryMutex.Unlock() // <<< Unlock after accessing registry
+	// --- End Global Registry Check ---
+
+	// +++ DEBUG LOGGING (Optional) +++
+	// if s.Logger.Enabled(context.Background(), slog.LevelDebug) {
+	// ... (logging code as before) ...
+	// }
 	// +++ END DEBUG LOGGING +++
 
-	appendErr := s.appender.AppendRow(rowArgs...)
-	if appendErr != nil {
-		s.Logger.Error("DuckDB Appender.AppendRow failed", "line", lineNumber, "error", appendErr)
-		return fmt.Errorf("duckdb append row: %w", appendErr)
+	// Send data to writer channel, respecting context cancellation
+	select {
+	case <-ctx.Done():
+		s.Logger.Warn("Context cancelled before sending data to writer channel", "line", lineNumber, "error", ctx.Err())
+		return ctx.Err() // Propagate cancellation error
+	case s.WriterChan <- op:
+		// Successfully sent
+		return nil
 	}
-	return nil
 }
 
-// closeSection flushes and closes the section's appender AND connection.
-func (s *csvSection) closeSection() error {
-	var closeErrors error
-	l := s.Logger.With(slog.String("table", s.TableName))
-	// Close Appender first
-	if s.appender != nil {
-		l.Debug("Flushing and closing section appender.")
-		if err := s.appender.Flush(); err != nil {
-			l.Error("Failed to flush section appender", "error", err)
-			closeErrors = errors.Join(closeErrors, fmt.Errorf("flush appender %s: %w", s.TableName, err))
-		}
-		if err := s.appender.Close(); err != nil {
-			l.Error("Failed to close section appender", "error", err)
-			closeErrors = errors.Join(closeErrors, fmt.Errorf("close appender %s: %w", s.TableName, err))
-		}
-		s.appender = nil
-		s.AppenderCreated = false
-	}
-	// Close the section's connection
-	if s.sectionConn != nil {
-		l.Debug("Closing section DB connection.")
-		if err := s.sectionConn.Close(); err != nil {
-			l.Error("Failed to close section DB connection", "error", err)
-			closeErrors = errors.Join(closeErrors, fmt.Errorf("close section conn %s: %w", s.TableName, err))
-		}
-		s.sectionConn = nil
-	}
-	return closeErrors
-}
-
-// processCSVStream reads CSV data and writes sections using section-specific connections/appenders.
+// processCSVStream reads CSV data, parses, looks ahead for schema inference (once per table globally),
+// and sends WriteOperation to writer channel.
 func processCSVStream(
 	ctx context.Context, cfg config.Config, logger *slog.Logger,
-	dbPool *sql.DB, // <<< Pass pool for logging/checks
+	writerChan chan<- WriteOperation, // <<< Pass writer channel
 	csvReader io.Reader, zipBaseName string,
 ) error {
 	reader := csv.NewReader(csvReader)
@@ -510,20 +439,9 @@ func processCSVStream(
 	var currentSection *csvSection
 	var accumulatedErrors error
 	lineNumber := int64(0)
-
-	// Defer closing the last section's appender AND connection
-	defer func() {
-		if currentSection != nil {
-			l := logger
-			if currentSection.Logger != nil {
-				l = currentSection.Logger
-			}
-			l.Warn("Closing last section via defer", slog.String("table", currentSection.TableName), slog.Any("error", accumulatedErrors), slog.Any("context_error", ctx.Err()))
-			if err := currentSection.closeSection(); err != nil {
-				l.Error("Error during deferred cleanup of last section", "error", err)
-			}
-		}
-	}()
+	var bufferedRows [][]string // Buffer for lookahead
+	var bufferedLineNumbers []int64
+	// isFirstDRecordInSection removed, logic moved to prepareAndSendData with global check
 
 	for {
 		select {
@@ -533,37 +451,46 @@ func processCSVStream(
 			return accumulatedErrors
 		default:
 		}
-		lineNumber++
-		record, err := reader.Read()
-		if err == io.EOF {
-			logger.Debug("Reached end of CSV stream.")
-			break
-		}
-		if err != nil {
-			if parseErr, ok := err.(*csv.ParseError); ok {
-				logger.Warn("CSV parsing error, skipping row.", "line", lineNumber, "csv_error", parseErr.Error())
-				accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("csv parse line %d: %w", lineNumber, err))
-				continue
+
+		var record []string
+		var readErr error
+		var currentLineNumber int64
+
+		if len(bufferedRows) > 0 {
+			record = bufferedRows[0]
+			currentLineNumber = bufferedLineNumbers[0]
+			bufferedRows = bufferedRows[1:]
+			bufferedLineNumbers = bufferedLineNumbers[1:]
+		} else {
+			lineNumber++
+			currentLineNumber = lineNumber
+			record, readErr = reader.Read()
+			if readErr == io.EOF {
+				logger.Debug("Reached end of CSV stream.")
+				break
 			}
-			logger.Error("Fatal error reading CSV stream", "line", lineNumber, "error", err)
-			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("csv read line %d: %w", lineNumber, err))
-			return accumulatedErrors
+			if readErr != nil {
+				if parseErr, ok := readErr.(*csv.ParseError); ok {
+					logger.Warn("CSV parsing error, skipping row.", "line", currentLineNumber, "csv_error", parseErr.Error())
+					accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("csv parse line %d: %w", currentLineNumber, readErr))
+					continue
+				}
+				logger.Error("Fatal error reading CSV stream", "line", currentLineNumber, "error", readErr)
+				accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("csv read line %d: %w", currentLineNumber, readErr))
+				return accumulatedErrors
+			}
 		}
+
 		if len(record) == 0 {
 			continue
 		}
 		recordType := record[0]
-		l := logger.With(slog.Int64("line", lineNumber), slog.String("record_type", recordType))
+		l := logger.With(slog.Int64("line", currentLineNumber), slog.String("record_type", recordType))
 
 		switch recordType {
 		case "I":
-			// Finalize previous section (closes its appender and connection)
 			if currentSection != nil {
-				l.Debug("Closing previous section", slog.String("table", currentSection.TableName))
-				if err := currentSection.closeSection(); err != nil {
-					l.Error("Failed to close previous section cleanly", "error", err)
-					accumulatedErrors = errors.Join(accumulatedErrors, err)
-				}
+				l.Debug("Ending previous section", slog.String("table", currentSection.TableName))
 				currentSection = nil
 			}
 			if len(record) < 4 {
@@ -577,12 +504,14 @@ func processCSVStream(
 				continue
 			}
 			var sectionErr error
-			currentSection, sectionErr = newCSVSection(ctx, cfg, logger, dbPool, comp, ver, headers) // Pass pool
+			currentSection, sectionErr = newCSVSection(ctx, cfg, logger, writerChan, comp, ver, headers)
 			if sectionErr != nil {
-				l.Error("Failed to initialize new CSV section", "error", sectionErr)
+				l.Error("Failed to initialize new CSV section parser", "error", sectionErr)
 				accumulatedErrors = errors.Join(accumulatedErrors, sectionErr)
 				return accumulatedErrors
 			}
+			bufferedRows = nil
+			bufferedLineNumbers = nil // Reset buffer
 
 		case "D":
 			if currentSection == nil {
@@ -595,55 +524,189 @@ func processCSVStream(
 			}
 			dataValues := record[4:]
 
-			if !currentSection.SchemaInferred {
-				currentSection.RowsChecked++
-				inferenceValues := make([]string, len(currentSection.Headers))
-				hasBlanks := false
-				for i := range currentSection.Headers {
-					if i >= len(dataValues) || dataValues[i] == "" {
-						hasBlanks = true
-						inferenceValues[i] = ""
+			// --- Schema Inference Logic (Runs only if schema not known GLOBALLY) ---
+			schemaRegistryMutex.Lock() // Lock before checking global registry
+			_, schemaKnownGlobally := schemaRegistry[currentSection.TableName]
+			schemaRegistryMutex.Unlock() // Unlock immediately after check
+
+			if !schemaKnownGlobally {
+				// Schema not known globally - This must be the first 'D' encountered for this table name globally.
+				// Perform lookahead and inference. This block will only run ONCE per table name.
+				if !currentSection.SchemaKnown { // Double check: Should only infer if not known locally either
+					schemaLookaheadLimit := cfg.SchemaRowLimit
+					if schemaLookaheadLimit <= 0 {
+						schemaLookaheadLimit = 10
+					}
+					var inferenceRow []string
+					var inferenceLine int64 = -1
+					foundNonBlank := false
+
+					// Start buffer with the current row
+					bufferedRows = append(bufferedRows, dataValues)
+					bufferedLineNumbers = append(bufferedLineNumbers, currentLineNumber)
+
+					hasBlanks := false
+					for _, val := range dataValues {
+						if val == "" {
+							hasBlanks = true
+							break
+						}
+					}
+
+					if !hasBlanks {
+						l.Debug("Using first 'D' row for schema inference (no blanks).", slog.Int64("line", currentLineNumber))
+						inferenceRow = dataValues
+						inferenceLine = currentLineNumber
+						foundNonBlank = true
 					} else {
-						inferenceValues[i] = dataValues[i]
+						l.Debug("First 'D' row has blanks, looking ahead for schema inference.", slog.Int("limit", schemaLookaheadLimit))
+						for i := 1; i < schemaLookaheadLimit; i++ {
+							select {
+							case <-ctx.Done():
+								return errors.Join(accumulatedErrors, ctx.Err())
+							default:
+							}
+							lookaheadLineNumber := lineNumber + 1
+							nextRecord, readErr := reader.Read()
+							if readErr == io.EOF {
+								l.Debug("EOF reached during schema lookahead.")
+								break
+							}
+							if readErr != nil {
+								if pErr, ok := readErr.(*csv.ParseError); ok {
+									l.Warn("CSV parsing error during lookahead, skipping.", "line", lookaheadLineNumber, "csv_error", pErr.Error())
+									accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("lookahead parse line %d: %w", lookaheadLineNumber, readErr))
+									continue
+								}
+								l.Error("Fatal error reading CSV during lookahead", "line", lookaheadLineNumber, "error", readErr)
+								accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("lookahead read line %d: %w", lookaheadLineNumber, readErr))
+								return accumulatedErrors
+							}
+							lineNumber = lookaheadLineNumber // Update main line number
+
+							if len(nextRecord) == 0 {
+								continue
+							}
+							if nextRecord[0] != "D" {
+								l.Debug("Non-'D' record encountered during lookahead, stopping.", "line", lineNumber, "next_type", nextRecord[0])
+								bufferedRows = append([][]string{nextRecord}, bufferedRows...) // Prepend non-D row
+								bufferedLineNumbers = append([]int64{lineNumber}, bufferedLineNumbers...)
+								break
+							}
+							if len(nextRecord) < 4 {
+								l.Warn("Malformed 'D' record during lookahead, skipping.", "line", lookaheadLineNumber)
+								continue
+							}
+
+							nextDataValues := nextRecord[4:]
+							bufferedRows = append(bufferedRows, nextDataValues)
+							bufferedLineNumbers = append(bufferedLineNumbers, lineNumber)
+
+							rowHasBlanks := false
+							for _, val := range nextDataValues {
+								if val == "" {
+									rowHasBlanks = true
+									break
+								}
+							}
+							if !rowHasBlanks {
+								l.Debug("Found non-blank row during lookahead for schema inference.", slog.Int64("line", lineNumber))
+								inferenceRow = nextDataValues
+								inferenceLine = lineNumber
+								foundNonBlank = true
+								break
+							}
+						} // End lookahead loop
+					}
+
+					// Select inference row
+					if !foundNonBlank {
+						if len(bufferedRows) > 0 {
+							lastDIndex := -1
+							for idx := len(bufferedRows) - 1; idx >= 0; idx-- {
+								recordToCheck := bufferedRows[idx]
+								if len(recordToCheck) > 0 && recordToCheck[0] == "D" {
+									lastDIndex = idx
+									break
+								}
+							}
+							if lastDIndex != -1 && len(bufferedRows[lastDIndex]) > 4 {
+								inferenceRow = bufferedRows[lastDIndex][4:]
+								inferenceLine = bufferedLineNumbers[lastDIndex]
+								l.Warn("No non-blank row found within lookahead limit, inferring schema from last 'D' row read.", "line", inferenceLine, slog.Int("limit", schemaLookaheadLimit))
+							} else {
+								l.Error("Buffer contains no suitable 'D' rows after lookahead to infer schema.", slog.String("table", currentSection.TableName))
+								accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("no suitable D rows in buffer for schema inference in table %s", currentSection.TableName))
+								currentSection = nil
+								continue
+							}
+						} else {
+							l.Error("No suitable 'D' rows found to infer schema for section.", slog.String("table", currentSection.TableName))
+							accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("no D rows for schema inference in table %s", currentSection.TableName))
+							currentSection = nil
+							continue
+						}
+					}
+
+					// Perform schema inference and register globally
+					err := currentSection.inferAndRegisterSchema(inferenceRow) // Infers and updates registry
+					if err != nil {
+						l.Error("Failed to infer and register schema, skipping section.", "line", inferenceLine, "error", err)
+						accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("schema inference/register line %d: %w", inferenceLine, err))
+						currentSection = nil
+						continue
+					}
+					// Schema is now known locally (SchemaKnown=true) and registered globally
+				} // End if !currentSection.SchemaKnown (local check)
+			} else {
+				// Schema known globally, ensure it's loaded locally if this section just started
+				if !currentSection.SchemaKnown {
+					l.Debug("Schema already known globally, adopting types locally.", slog.Int64("line", currentLineNumber))
+					schemaRegistryMutex.Lock() // Lock to safely read global info
+					globalInfo, exists := schemaRegistry[currentSection.TableName]
+					schemaRegistryMutex.Unlock() // Unlock after reading
+					if exists {
+						currentSection.DuckdbTypes = globalInfo.DuckdbTypes
+						currentSection.IsDateColumn = globalInfo.IsDateColumn
+						currentSection.ColumnNames = globalInfo.ColumnNames
+						currentSection.Headers = globalInfo.Headers
+						for i, dt := range currentSection.DuckdbTypes {
+							currentSection.columnIndexMap[i] = dt
+						}
+						currentSection.SchemaKnown = true
+					} else {
+						// Should not happen if global check was correct, but handle defensively
+						l.Error("Global schema info missing unexpectedly!", slog.String("table", currentSection.TableName))
+						accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("global schema missing for table %s", currentSection.TableName))
+						currentSection = nil
+						continue
 					}
 				}
-				if hasBlanks {
-					l.Info("Inferring schema using first 'D' row which contains blanks.")
-				} else {
-					l.Debug("Inferring schema from first 'D' row.")
-				}
+			} // End schema inference/adoption block
 
-				// This now creates the sectionConn and appender inside
-				err := currentSection.inferSchemaAndEnsureTable(ctx, inferenceValues)
-				if err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						l.Warn("Context cancelled during schema inference/table creation.", "error", err)
-						accumulatedErrors = errors.Join(accumulatedErrors, err)
+			// --- Process Data Row (Schema MUST be known by now if section is valid) ---
+			if currentSection != nil && currentSection.SchemaKnown {
+				// Determine if this specific call should mark the chunk as the first globally
+				// This is now handled correctly within prepareAndSendData
+				sendErr := currentSection.prepareAndSendData(ctx, dataValues, currentLineNumber) // Pass currentLineNumber
+				if sendErr != nil {
+					if errors.Is(sendErr, context.Canceled) || errors.Is(sendErr, context.DeadlineExceeded) {
+						l.Warn("Context cancelled during send, stopping stream.", "error", sendErr)
+						accumulatedErrors = errors.Join(accumulatedErrors, sendErr)
 						return accumulatedErrors
 					}
-					l.Error("Failed to infer schema/ensure table/init appender, skipping section.", "error", err)
-					accumulatedErrors = errors.Join(accumulatedErrors, err)
-					currentSection = nil
-					continue // Skip section
-				}
-			}
-
-			if currentSection != nil && currentSection.SchemaInferred {
-				appendErr := currentSection.appendRow(dataValues, lineNumber) // Pass lineNumber
-				if appendErr != nil {
-					l.Warn("Failed to append row to DuckDB, skipping row.", "error", appendErr)
-					accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("append line %d: %w", lineNumber, appendErr))
-					// If append fails, maybe we should close the section and start fresh if another 'I' comes?
-					// For now, just accumulate error and continue stream.
+					l.Warn("Failed to prepare/send row, skipping.", "error", sendErr) // Conversion errors already logged
+					accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("prepare/send line %d: %w", currentLineNumber, sendErr))
 				}
 			}
 
 		default:
-			continue
+			continue // Ignore other record types
 		}
 	} // End record reading loop
 
-	// Final cleanup handled by defer
-
+	if currentSection != nil {
+		logger.Debug("Finished processing last section", slog.String("table", currentSection.TableName))
+	}
 	return accumulatedErrors
 }
