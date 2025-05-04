@@ -1,0 +1,3578 @@
+>>> Searching for .go files and printing contents...
+
+##################################################
+# File: ./internal/processor/processor_test.go
+##################################################
+package processor
+
+import (
+	"bufio"
+	"bytes" // Needed for capturing logs
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	// Use your actual module path for config and util
+	"github.com/brensch/nemparquet/internal/config"
+	// "github.com/brensch/nemparquet/internal/util" // Not directly needed
+
+	// Import parquet reader
+	"github.com/xitongsys/parquet-go-source/local"
+	"github.com/xitongsys/parquet-go/reader"
+)
+
+// --- Log Capturing Handler ---
+
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+	next    slog.Handler
+}
+
+func NewCapturingHandler(next slog.Handler) *capturingHandler {
+	if next == nil {
+		next = slog.NewTextHandler(io.Discard, nil)
+	}
+	return &capturingHandler{next: next}
+}
+func (h *capturingHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.next.Enabled(ctx, level)
+}
+func (h *capturingHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.records = append(h.records, r.Clone())
+	h.mu.Unlock()
+	// return h.next.Handle(ctx, r) // Uncomment to also print logs during test
+	return nil
+}
+func (h *capturingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return NewCapturingHandler(h.next.WithAttrs(attrs))
+}
+func (h *capturingHandler) WithGroup(name string) slog.Handler {
+	return NewCapturingHandler(h.next.WithGroup(name))
+}
+func (h *capturingHandler) GetRecordsByLevel(minLevel slog.Level) []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	filtered := make([]slog.Record, 0)
+	for _, r := range h.records {
+		if r.Level >= minLevel {
+			filtered = append(filtered, r.Clone())
+		}
+	}
+	return filtered
+}
+
+// --- Main Test Function ---
+
+// TestProcessCSVStream_Directory reads all *.csv files in the current directory
+// and runs processCSVStream on each, verifying logs and output.
+func TestProcessCSVStream_Directory(t *testing.T) {
+	// --- Test Setup ---
+	ctx := context.Background()
+	tempDir := t.TempDir() // Unique output dir for this test run
+	t.Logf("Using temporary output directory: %s", tempDir)
+
+	cfg := config.Config{OutputDir: tempDir, SchemaRowLimit: 100} // Use default limit or adjust
+
+	// Find test CSV files in the current directory (".")
+	csvFiles, err := filepath.Glob("*.csv") // Look for CSVs in the same dir as the test
+	if err != nil {
+		t.Fatalf("Failed to glob for csv files in current directory: %v", err)
+	}
+	if len(csvFiles) == 0 {
+		t.Skipf("No *.csv files found in the current directory (%s), skipping test", getWd(t))
+	}
+	t.Logf("Found test files: %v", csvFiles)
+
+	// --- Execute and Assert for each file ---
+	for _, csvFilename := range csvFiles {
+		// Use relative path for subtest name
+		csvFilename := csvFilename // Capture loop variable for subtest
+
+		t.Run(csvFilename, func(t *testing.T) {
+			// Create a new logger and handler for each subtest
+			logBuf := &bytes.Buffer{}
+			// handler := NewCapturingHandler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})) // For debugging test
+			handler := NewCapturingHandler(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})) // Capture WARN+
+			testLogger := slog.New(handler)
+
+			// Read the specific CSV test file content
+			csvData, err := os.ReadFile(csvFilename)
+			if err != nil {
+				t.Fatalf("Failed to read test file %s: %v", csvFilename, err)
+			}
+			csvReader := bytes.NewReader(csvData)
+
+			// --- Count expected 'D' rows per section dynamically ---
+			dRowCount := make(map[string]int64)
+			currentSectionKey := ""
+			// Use a simple scanner, not the PeekableScanner for counting
+			scanner := bufio.NewScanner(strings.NewReader(string(csvData)))
+			lineNum := 0
+			for scanner.Scan() {
+				lineNum++
+				line := scanner.Text()
+				parts := strings.Split(line, ",")
+				if len(parts) > 0 {
+					recordType := strings.TrimSpace(parts[0])
+					if recordType == "I" && len(parts) >= 4 {
+						comp := strings.TrimSpace(parts[2])
+						ver := strings.TrimSpace(parts[3])
+						currentSectionKey = fmt.Sprintf("%s_v%s", comp, ver)
+						dRowCount[currentSectionKey] = 0 // Initialize/reset count
+					} else if recordType == "D" && currentSectionKey != "" {
+						dRowCount[currentSectionKey]++ // Increment count for current section
+					}
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatalf("Error counting D rows in %s: %v", csvFilename, err)
+			}
+			t.Logf("Counted D rows for %s: %v", csvFilename, dRowCount)
+			if len(dRowCount) == 0 {
+				t.Logf("No 'I' sections found or no 'D' rows found in %s", csvFilename)
+				// Decide if this is an error or just an empty/non-standard file to skip further checks
+			}
+			// --- End Counting ---
+
+			// Define the base name for output files from the CSV filename
+			zipBaseName := strings.TrimSuffix(csvFilename, filepath.Ext(csvFilename))
+
+			// --- Execute ---
+			processErr := processCSVStream(ctx, cfg, testLogger, csvReader, zipBaseName, cfg.OutputDir)
+
+			// --- Assertions ---
+			// 1. Check for direct processing error
+			if processErr != nil {
+				t.Errorf("processCSVStream for %s returned an unexpected error: %v", csvFilename, processErr)
+				// Optionally print captured logs on error for easier debugging
+				capturedRecordsOnError := handler.GetRecordsByLevel(slog.LevelDebug)
+				if len(capturedRecordsOnError) > 0 {
+					t.Logf("--- Captured Logs for %s on Error ---", csvFilename)
+					for _, rec := range capturedRecordsOnError {
+						t.Logf("[%s] %s", rec.Level, rec.Message) // Basic log format
+					}
+					t.Logf("--- End Logs ---")
+				}
+			}
+
+			// 2. Check captured logs for unexpected WARN or ERROR level messages
+			capturedRecords := handler.GetRecordsByLevel(slog.LevelWarn)
+			for _, rec := range capturedRecords {
+				// Allow the "Inferring schema from row with blanks" warning
+				if strings.Contains(rec.Message, "Inferring schema from row with blanks") {
+					t.Logf("Found expected 'inferring from blanks' warning for %s: %s", csvFilename, rec.Message)
+					continue // Don't fail the test for this specific warning
+				}
+				// Fail on any other WARN or ERROR
+				t.Errorf("Found unexpected WARN/ERROR log message for %s: Level=%s Message=%q", csvFilename, rec.Level, rec.Message)
+			}
+
+			// 3. Verify Parquet file existence and row counts for sections with D rows
+			if len(dRowCount) > 0 {
+				for sectionKey, expectedDRows := range dRowCount {
+					// Construct expected parquet filename: zipBaseName_Comp_vVer.parquet
+					parquetFilename := fmt.Sprintf("%s_%s.parquet", zipBaseName, sectionKey)
+					parquetPath := filepath.Join(tempDir, parquetFilename)
+
+					if _, statErr := os.Stat(parquetPath); statErr != nil {
+						// Only fail if we expected rows for this section
+						if expectedDRows > 0 {
+							t.Errorf("Expected output file %s was not found for %s: %v", parquetFilename, csvFilename, statErr)
+						} else {
+							t.Logf("Output file %s not found, but 0 D rows were expected.", parquetFilename)
+						}
+						continue // Skip row count check if file doesn't exist
+					}
+
+					// If file exists but we expected 0 rows, that's also potentially an issue
+					if expectedDRows == 0 {
+						t.Errorf("Output file %s exists, but 0 D rows were expected for this section in %s.", parquetFilename, csvFilename)
+						continue
+					}
+
+					// Read row count from Parquet file
+					fr, err := local.NewLocalFileReader(parquetPath)
+					if err != nil {
+						t.Errorf("Failed to open generated parquet file %s: %v", parquetFilename, err)
+						continue
+					}
+					pr, err := reader.NewParquetReader(fr, nil, 1)
+					if err != nil {
+						t.Errorf("Failed to create parquet reader for %s: %v", parquetFilename, err)
+						fr.Close()
+						continue
+					}
+
+					parquetRowCount := pr.GetNumRows()
+					pr.ReadStop() // Important to stop reader goroutines
+					fr.Close()
+
+					// Compare counts
+					if parquetRowCount != expectedDRows {
+						t.Errorf("Row count mismatch for %s: expected %d 'D' rows, got %d Parquet rows", parquetFilename, expectedDRows, parquetRowCount)
+					} else {
+						t.Logf("Row count verified for %s: %d rows", parquetFilename, parquetRowCount)
+					}
+				}
+			} else {
+				// Check if any unexpected parquet files were created for this zipBaseName
+				files, _ := filepath.Glob(filepath.Join(tempDir, zipBaseName+"_*.parquet"))
+				if len(files) > 0 {
+					t.Errorf("No D rows counted in %s, but Parquet files were created: %v", csvFilename, files)
+				}
+			}
+
+		}) // End subtest
+	} // End loop through CSV files
+}
+
+// Helper to get working directory for logging
+func getWd(t *testing.T) string {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Logf("Warning: could not get working directory: %v", err)
+		return "[unknown]"
+	}
+	return wd
+}
+
+
+##################################################
+# File: ./internal/processor/processor.go
+##################################################
+package processor
+
+import (
+	"archive/zip"
+	// "bufio" // No longer needed for main loop
+	"context"
+	"database/sql"
+	"encoding/csv" // Import encoding/csv
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/config"
+	"github.com/brensch/nemparquet/internal/db"
+	"github.com/brensch/nemparquet/internal/util" // Keep for datetime
+
+	"github.com/xitongsys/parquet-go-source/local"
+	"github.com/xitongsys/parquet-go/parquet"
+	"github.com/xitongsys/parquet-go/source"
+	"github.com/xitongsys/parquet-go/writer"
+)
+
+// StartProcessorWorkers launches goroutines to process zip paths from a channel.
+// It respects the forceProcess flag when checking DB state.
+func StartProcessorWorkers(
+	ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger,
+	numWorkers int, pathsChan <-chan string, // Read from channel
+	wg *sync.WaitGroup, errorsMap *sync.Map, // Use pointers for WG and Map
+	forceProcess bool, // Add forceProcess flag
+) {
+	logger.Info("Starting processor workers", slog.Int("count", numWorkers))
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1) // Add to WG for each worker started
+		go func(workerID int) {
+			defer wg.Done() // Signal completion when goroutine exits
+			l := logger.With(slog.Int("worker_id", workerID))
+			l.Debug("Processing worker started")
+
+			// Read zip file paths from the channel until it's closed
+			for zipFilePath := range pathsChan {
+				// Create a new logger instance for this specific job with its context
+				jobLogger := l.With(slog.String("zip_file_path", zipFilePath))
+
+				jobLogger.Info("Checking processing state.")
+				// 1. Find original identifier (URL or inner zip name) from DB using output path
+				absZipFilePath, pathErr := filepath.Abs(zipFilePath)
+				if pathErr != nil {
+					jobLogger.Error("Failed get absolute path, skipping.", "error", pathErr)
+					errorsMap.Store(zipFilePath, pathErr) // Store error against the path key
+					continue                              // Skip to next job
+				}
+
+				// Use the renamed GetIdentifierForOutputPath function
+				identifier, fileType, foundID, dbErr := db.GetIdentifierForOutputPath(ctx, dbConn, absZipFilePath)
+				if dbErr != nil {
+					jobLogger.Error("DB error finding identifier for path, skipping.", "error", dbErr)
+					errorsMap.Store(zipFilePath, dbErr)
+					continue
+				}
+				if !foundID {
+					jobLogger.Warn("Could not find identifier (URL/inner name) in DB for this zip path, skipping.", slog.String("abs_path", absZipFilePath))
+					// Optionally store a specific error/skip reason
+					// errorsMap.Store(zipFilePath, fmt.Errorf("identifier not found in DB for path %s", absZipFilePath))
+					continue
+				}
+				// Log the correct file type found
+				jobLogger = jobLogger.With(slog.String("identifier", identifier), slog.String("file_type", fileType))
+
+				// 2. Check if already processed successfully using the identifier and type
+				processCompleted := false // Assume not completed initially
+				if !forceProcess {        // Only check DB if not forcing
+					var checkErr error
+					// Use the found identifier and filetype for the check
+					processCompleted, checkErr = db.HasEventOccurred(ctx, dbConn, identifier, fileType, db.EventProcessEnd)
+					if checkErr != nil {
+						jobLogger.Warn("Failed check DB state for process completion, proceeding cautiously.", "error", checkErr)
+						db.LogFileEvent(ctx, dbConn, identifier, fileType, db.EventError, "", "", fmt.Sprintf("db check process failed: %v", checkErr), "", nil)
+						processCompleted = false // Assume not completed if check fails
+					}
+				} else {
+					jobLogger.Info("Force process enabled, skipping DB completion check.")
+				}
+
+				if processCompleted { // Skip only if not forcing AND already completed
+					jobLogger.Info("Skipping processing, already completed according to DB.")
+					db.LogFileEvent(ctx, dbConn, identifier, fileType, db.EventSkipProcess, "", "", "Already processed", "", nil)
+					continue // Skip to next job
+				}
+
+				// --- Proceed with Processing ---
+				jobLogger.Info("Starting processing.")
+				startTime := time.Now()
+				// Log process start for the identifier
+				db.LogFileEvent(ctx, dbConn, identifier, fileType, db.EventProcessStart, "", "", "", "", nil)
+
+				// 3. Process the Zip Archive
+				// Pass identifier and fileType for potential logging inside
+				processErr := processSingleZipArchive(ctx, cfg, jobLogger, zipFilePath, identifier, fileType)
+				duration := time.Since(startTime)
+
+				// 4. Log event based on result for the identifier
+				if processErr != nil {
+					jobLogger.Error("Failed to process zip archive", "error", processErr, slog.Duration("duration", duration.Round(time.Millisecond)))
+					db.LogFileEvent(ctx, dbConn, identifier, fileType, db.EventError, "", "", processErr.Error(), "", &duration)
+					errorsMap.Store(zipFilePath, processErr) // Store error against path
+				} else {
+					jobLogger.Info("Processing successful.", slog.Duration("duration", duration.Round(time.Millisecond)))
+					db.LogFileEvent(ctx, dbConn, identifier, fileType, db.EventProcessEnd, "", "", "", "", &duration)
+				}
+
+			} // End job loop (channel closed)
+			l.Debug("Processing worker finished")
+		}(i)
+	}
+}
+
+// processSingleZipArchive opens a zip archive from disk and processes contained CSVs.
+// Now takes identifier and fileType for context.
+func processSingleZipArchive(ctx context.Context, cfg config.Config, logger *slog.Logger, zipFilePath string, identifier string, fileType string) error {
+	l := logger // Use logger with existing context
+
+	l.Debug("Opening zip archive from disk.")
+	zr, err := zip.OpenReader(zipFilePath)
+	if err != nil {
+		l.Error("Failed to open zip archive", "error", err)
+		return fmt.Errorf("zip.OpenReader %s: %w", zipFilePath, err)
+	}
+	defer zr.Close()
+
+	var processingErrors error
+	csvFoundCount := 0
+	zipBaseName := strings.TrimSuffix(filepath.Base(zipFilePath), filepath.Ext(zipFilePath))
+
+	for _, f := range zr.File {
+		// Check context cancellation before processing each internal file
+		select {
+		case <-ctx.Done():
+			l.Warn("Processing cancelled.")
+			return errors.Join(processingErrors, ctx.Err()) // Combine errors with context error
+		default:
+			// Continue processing file
+		}
+
+		if f.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(f.Name), ".csv") {
+			continue
+		}
+		csvFoundCount++
+		csvBaseName := filepath.Base(f.Name)
+		csvLogger := l.With(slog.String("internal_csv", csvBaseName)) // Create logger specific to this CSV
+		csvLogger.Debug("Found CSV inside archive, starting stream processing.")
+
+		// Open the file *within* the zip archive
+		rc, err := f.Open()
+		if err != nil {
+			csvLogger.Error("Failed to open internal CSV file.", "error", err)
+			processingErrors = errors.Join(processingErrors, fmt.Errorf("open internal %s: %w", csvBaseName, err))
+			continue // Process next file in zip
+		}
+
+		// Call the stream processor
+		// Pass identifier (original zip URL/name) as source context if needed by stream processor?
+		// Currently processCSVStream only uses zipBaseName (from the local file) for output naming.
+		streamErr := processCSVStream(ctx, cfg, csvLogger, rc, zipBaseName, cfg.OutputDir)
+		closeErr := rc.Close() // Close immediately after processing attempt
+
+		if streamErr != nil {
+			csvLogger.Error("Failed to process internal CSV stream.", "error", streamErr)
+			processingErrors = errors.Join(processingErrors, fmt.Errorf("process stream %s: %w", csvBaseName, streamErr))
+			// Log CSV error event?
+			// db.LogFileEvent(ctx, getDB(), csvBaseName, db.FileTypeCsv, db.EventError, identifier, "", streamErr.Error(), "", nil) // Requires passing dbConn down
+		} else {
+			csvLogger.Debug("Successfully processed CSV stream to Parquet sections.")
+		}
+		if closeErr != nil {
+			// Log error closing the internal reader, but don't necessarily fail the whole zip for it
+			csvLogger.Warn("Error closing internal CSV reader.", "error", closeErr)
+			processingErrors = errors.Join(processingErrors, fmt.Errorf("close reader %s: %w", csvBaseName, closeErr))
+		}
+	}
+
+	if csvFoundCount == 0 {
+		l.Info("No CSV files found within this zip archive.")
+		// Is this an error? Or just an empty zip? Treat as success for now.
+	} else if processingErrors != nil {
+		l.Warn("Finished processing zip, but encountered errors with internal CSVs.", "error", processingErrors)
+	} else {
+		l.Debug("Finished processing all CSVs found in zip archive.")
+	}
+
+	return processingErrors // Return aggregated errors from processing internal CSVs
+}
+
+// --- Section Processing Logic (Using encoding/csv) ---
+
+// csvSection holds state for processing one I..D..D section
+type csvSection struct {
+	Cfg             config.Config
+	Logger          *slog.Logger
+	ZipBaseName     string // Base name derived from the zip file
+	OutputDir       string
+	Comp            string   // Component from 'I' record
+	Ver             string   // Version from 'I' record
+	Headers         []string // Headers from 'I' record
+	Meta            []string // Parquet schema meta strings
+	IsDateColumn    []bool   // Flags for date columns
+	SchemaInferred  bool
+	RowsChecked     int
+	ParquetFilePath string
+	FileWriter      source.ParquetFile // Interface for file writing
+	ParquetWriter   *writer.CSVWriter  // Parquet library writer
+}
+
+// newCSVSection initializes a section processor.
+func newCSVSection(ctx context.Context, cfg config.Config, logger *slog.Logger, zipBaseName, outputDir, comp, ver string, headers []string) (*csvSection, error) {
+	s := &csvSection{
+		Cfg:         cfg,
+		Logger:      logger.With(slog.String("comp", comp), slog.String("ver", ver)),
+		ZipBaseName: zipBaseName,
+		OutputDir:   outputDir,
+		Comp:        comp,
+		Ver:         ver,
+		Headers:     headers,
+	}
+	s.Logger.Debug("New CSV section initialized.")
+	return s, nil
+}
+
+// inferSchemaAndInitWriter attempts to infer the schema from a data row and initializes the Parquet writer.
+func (s *csvSection) inferSchemaAndInitWriter(values []string) error {
+	s.Logger.Debug("Inferring schema and initializing writer.")
+	s.Meta = make([]string, len(s.Headers))
+	s.IsDateColumn = make([]bool, len(s.Headers))
+
+	for i := range s.Headers {
+		var typ string
+		val := values[i] // Value from the first valid data row
+		headerLower := strings.ToLower(s.Headers[i])
+		isDate := false
+
+		if util.IsNEMDateTime(val) {
+			typ = "INT64" // Store dates as epoch milliseconds
+			isDate = true
+		} else if val == "" {
+			// HEURISTIC FOR BLANK VALUES during inference
+			if strings.Contains(headerLower, "datetime") || strings.Contains(headerLower, "_date") || strings.Contains(headerLower, "_time") {
+				typ = "INT64"
+				isDate = true
+			} else if strings.Contains(headerLower, "cost") || strings.Contains(headerLower, "rate") || strings.Contains(headerLower, "price") || strings.Contains(headerLower, "value") || strings.Contains(headerLower, "factor") || strings.Contains(headerLower, "mw") || strings.Contains(headerLower, "usage") || strings.Contains(headerLower, "rcr") || strings.HasSuffix(headerLower, "fpp") {
+				typ = "DOUBLE"
+			} else if strings.Contains(headerLower, "versionno") || strings.Contains(headerLower, "runno") || strings.HasSuffix(headerLower, "id") {
+				typ = "INT64" // Assume IDs are numeric even if sometimes blank
+			} else {
+				typ = "BYTE_ARRAY" // Default remaining blanks to string
+			}
+			s.Logger.Debug("Inferred type from blank value based on header heuristic", slog.String("header", s.Headers[i]), slog.String("inferred_type", typ))
+		} else if _, pErr := strconv.ParseBool(val); pErr == nil {
+			typ = "BOOLEAN"
+		} else if _, pErr := strconv.ParseInt(val, 10, 64); pErr == nil {
+			typ = "INT64"
+		} else if _, pErr := strconv.ParseFloat(val, 64); pErr == nil {
+			typ = "DOUBLE"
+		} else {
+			typ = "BYTE_ARRAY" // Default non-empty, non-parsable to string
+		}
+		s.IsDateColumn[i] = isDate // Store if it's a date type
+
+		// Clean header name for Parquet columns
+		cleanH := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s.Headers[i], " ", "_"), ".", "_"), ";", "_")
+		if cleanH == "" {
+			cleanH = fmt.Sprintf("column_%d", i)
+		} // Fallback
+
+		// Define schema element as optional
+		if typ == "BYTE_ARRAY" {
+			s.Meta[i] = fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", cleanH)
+		} else {
+			s.Meta[i] = fmt.Sprintf("name=%s, type=%s, repetitiontype=OPTIONAL", cleanH, typ)
+		}
+	}
+	s.Logger.Debug("Inferred schema", slog.String("schema_str", strings.Join(s.Meta, "; ")))
+
+	// Initialize Parquet writer
+	parquetFile := fmt.Sprintf("%s_%s_v%s.parquet", s.ZipBaseName, s.Comp, s.Ver)
+	s.ParquetFilePath = filepath.Join(s.OutputDir, parquetFile)
+
+	var createErr error
+	s.FileWriter, createErr = local.NewLocalFileWriter(s.ParquetFilePath)
+	if createErr != nil {
+		s.Logger.Error("Failed create parquet file", "path", s.ParquetFilePath, "error", createErr)
+		return fmt.Errorf("create file %s: %w", s.ParquetFilePath, createErr)
+	}
+
+	s.ParquetWriter, createErr = writer.NewCSVWriter(s.Meta, s.FileWriter, 4) // Use 4 write threads
+	if createErr != nil {
+		s.Logger.Error("Failed init parquet writer", "path", s.ParquetFilePath, "error", createErr)
+		s.FileWriter.Close() // Attempt to close the file handle
+		return fmt.Errorf("create writer %s: %w", s.ParquetFilePath, createErr)
+	}
+	s.ParquetWriter.CompressionType = parquet.CompressionCodec_SNAPPY
+	s.Logger.Debug("Created Parquet writer.", slog.String("path", s.ParquetFilePath))
+	s.SchemaInferred = true
+	return nil
+}
+
+// writeRow prepares, validates, and writes a single data row.
+// Returns a specific validation error if pre-write checks fail, or an error
+// from WriteString itself. Returns nil on success.
+func (s *csvSection) writeRow(record []string) error {
+	if !s.SchemaInferred || s.ParquetWriter == nil {
+		return errors.New("cannot write row: schema not inferred or writer not initialized")
+	}
+
+	numExpectedFields := len(s.Headers)
+	// Pad/truncate record to match header count
+	if len(record) < numExpectedFields {
+		s.Logger.Warn("Data row has fewer columns than header, padding with blanks.", "data_cols", len(record), "header_cols", numExpectedFields)
+		paddedRecord := make([]string, numExpectedFields)
+		copy(paddedRecord, record)
+		for i := len(record); i < numExpectedFields; i++ {
+			paddedRecord[i] = ""
+		}
+		record = paddedRecord
+	} else if len(record) > numExpectedFields {
+		s.Logger.Warn("Data row has more columns than header, truncating data.", "data_cols", len(record), "header_cols", numExpectedFields)
+		record = record[:numExpectedFields]
+	}
+
+	recPtrs := make([]*string, numExpectedFields)
+	validationFailed := false // Flag to track if validation fails for this row
+
+	var accumulatedErrors error
+	for j := 0; j < numExpectedFields; j++ {
+		value := record[j]
+		isEmpty := value == ""
+		finalValue := value // Start with the original value from the (padded/truncated) record
+
+		// Determine target type from schema meta string
+		isTargetStringType := false
+		targetType := "UNKNOWN" // Default
+		if j < len(s.Meta) {
+			metaLower := strings.ToLower(s.Meta[j])
+			if strings.Contains(metaLower, "type=byte_array") {
+				isTargetStringType = true
+				targetType = "STRING"
+			} else if strings.Contains(metaLower, "type=int") {
+				targetType = "INT64"
+			} else if strings.Contains(metaLower, "type=double") || strings.Contains(metaLower, "type=float") {
+				targetType = "DOUBLE"
+			} else if strings.Contains(metaLower, "type=boolean") {
+				targetType = "BOOLEAN"
+			}
+		}
+
+		// Convert date strings if applicable and not empty
+		if s.IsDateColumn[j] && !isEmpty {
+			targetType = "DATETIME_AS_INT64" // Override type for validation check
+			epochMS, convErr := util.NEMDateTimeToEpochMS(value)
+			if convErr != nil {
+				// Return a specific validation error for this column
+				err := fmt.Errorf("validation failed: column '%s': %w", s.Headers[j], convErr)
+				// s.Logger.Warn(err.Error(), "value", value) // Logged by caller
+				return err // Stop processing this row and return validation error
+			}
+			finalValue = strconv.FormatInt(epochMS, 10) // Use converted value for validation/writing
+		}
+
+		// *** PRE-WRITE VALIDATION ***
+		if isEmpty && !isTargetStringType {
+			// Empty string for a non-string target type. Prepare nil pointer.
+			recPtrs[j] = nil
+		} else if !isEmpty {
+			// Value is not empty, check if it's parseable for non-string types
+			parseError := false
+			var underlyingParseErr error
+			switch targetType {
+			case "INT64", "DATETIME_AS_INT64":
+				_, underlyingParseErr = strconv.ParseInt(finalValue, 10, 64)
+				if underlyingParseErr != nil {
+					parseError = true
+				}
+			case "DOUBLE":
+				_, underlyingParseErr = strconv.ParseFloat(finalValue, 64)
+				if underlyingParseErr != nil {
+					parseError = true
+				}
+			case "BOOLEAN":
+				_, underlyingParseErr = strconv.ParseBool(finalValue)
+				if underlyingParseErr != nil {
+					parseError = true
+				}
+			}
+
+			if parseError {
+				// Return a specific validation error
+				err := fmt.Errorf("validation failed: column '%s' (type %s): cannot parse value: %w", s.Headers[j], targetType, underlyingParseErr)
+				// s.Logger.Warn(err.Error(), "value", fmt.Sprintf("%q", value)) // Logged by caller
+				validationFailed = true                                 // Mark row as failed
+				accumulatedErrors = errors.Join(accumulatedErrors, err) // Accumulate validation error
+				recPtrs[j] = nil                                        // Set to nil to avoid WriteString error if possible, though row will be skipped
+				continue                                                // Continue processing other columns for potential errors? Or break? Let's continue.
+				// break // Stop processing this row if any column fails validation
+			}
+
+			// Validation passed or it's a string type, prepare pointer
+			temp := finalValue
+			recPtrs[j] = &temp
+
+		} else { // Value is empty AND target is string
+			temp := ""
+			recPtrs[j] = &temp
+		}
+	} // End loop preparing recPtrs
+
+	// If validation failed for any column, return the accumulated validation errors
+	if validationFailed {
+		return accumulatedErrors // Return the specific validation error(s)
+	}
+
+	// Validation passed, attempt to write the prepared row
+	if writeErr := s.ParquetWriter.WriteString(recPtrs); writeErr != nil {
+		s.Logger.Warn("WriteString error", "error", writeErr)
+		// Return the error from WriteString itself
+		return writeErr
+	}
+
+	return nil // Row written successfully
+}
+
+// close finalizes the current Parquet section.
+func (s *csvSection) close() error {
+	var closeErrors error
+	l := s.Logger.With(slog.String("path", s.ParquetFilePath)) // Add path context
+	if s.ParquetWriter != nil {
+		l.Debug("Stopping Parquet writer.")
+		if err := s.ParquetWriter.WriteStop(); err != nil {
+			l.Warn("Error stopping writer", "error", err)
+			closeErrors = errors.Join(closeErrors, fmt.Errorf("stop writer %s: %w", s.ParquetFilePath, err))
+		}
+	}
+	if s.FileWriter != nil {
+		l.Debug("Closing Parquet file.")
+		if err := s.FileWriter.Close(); err != nil {
+			l.Warn("Error closing file", "error", err)
+			closeErrors = errors.Join(closeErrors, fmt.Errorf("close file %s: %w", s.ParquetFilePath, err))
+		}
+	}
+	// Mark as closed to prevent double closing in defer
+	s.ParquetWriter = nil
+	s.FileWriter = nil
+	return closeErrors
+}
+
+// --- Main Stream Processing Function (Using encoding/csv) ---
+
+// processCSVStream reads CSV data using encoding/csv and writes Parquet sections.
+func processCSVStream(ctx context.Context, cfg config.Config, logger *slog.Logger, csvReader io.Reader, zipBaseName string, outputDir string) error {
+	reader := csv.NewReader(csvReader)
+	reader.Comment = '#'
+	reader.FieldsPerRecord = -1
+	reader.TrimLeadingSpace = true
+
+	var currentSection *csvSection
+	var accumulatedErrors error
+	lineNumber := int64(0)
+
+	// Defer cleanup
+	defer func() {
+		if currentSection != nil && currentSection.ParquetWriter != nil {
+			normalExit := accumulatedErrors == nil && ctx.Err() == nil
+			if !normalExit {
+				logger.Warn("Closing Parquet writer/file due to error or cancellation", slog.String("path", currentSection.ParquetFilePath), slog.Any("error", accumulatedErrors), slog.Any("context_error", ctx.Err()))
+				if err := currentSection.close(); err != nil {
+					logger.Error("Error during deferred cleanup of section", "error", err)
+				}
+			}
+		}
+	}()
+
+	// --- Main Record Reading Loop ---
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Warn("Stream processing cancelled.")
+			accumulatedErrors = errors.Join(accumulatedErrors, ctx.Err())
+			return accumulatedErrors
+		default:
+		}
+		lineNumber++
+		record, err := reader.Read()
+		if err == io.EOF {
+			logger.Debug("Reached end of CSV stream.")
+			break
+		}
+		if err != nil {
+			if parseErr, ok := err.(*csv.ParseError); ok {
+				logger.Warn("CSV parsing error, skipping row.", slog.Int64("line", lineNumber), slog.String("csv_error", parseErr.Error()))
+				accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("csv parse line %d: %w", lineNumber, err))
+				continue
+			}
+			logger.Error("Error reading CSV stream", slog.Int64("line", lineNumber), "error", err)
+			accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("csv read line %d: %w", lineNumber, err))
+			return accumulatedErrors
+		}
+		if len(record) == 0 {
+			continue
+		}
+		recordType := record[0]
+		l := logger.With(slog.Int64("line", lineNumber), slog.String("record_type", recordType))
+
+		switch recordType {
+		case "I":
+			if currentSection != nil {
+				if err := currentSection.close(); err != nil {
+					accumulatedErrors = errors.Join(accumulatedErrors, err)
+				}
+				currentSection = nil
+			}
+			if len(record) < 4 {
+				l.Warn("Malformed 'I' record", "record", record)
+				continue
+			}
+			comp, ver := record[2], record[3]
+			headers := make([]string, 0, len(record)-4)
+			for _, h := range record[4:] {
+				headers = append(headers, h)
+			}
+			if len(headers) == 0 {
+				l.Warn("'I' record no headers", "comp", comp, "ver", ver)
+				continue
+			}
+			var sectionErr error
+			currentSection, sectionErr = newCSVSection(ctx, cfg, logger, zipBaseName, outputDir, comp, ver, headers)
+			if sectionErr != nil {
+				l.Error("Failed to initialize new CSV section", "error", sectionErr)
+				accumulatedErrors = errors.Join(accumulatedErrors, sectionErr)
+				return accumulatedErrors
+			}
+
+		case "D":
+			if currentSection == nil {
+				continue
+			}
+			l = l.With(slog.String("comp", currentSection.Comp), slog.String("ver", currentSection.Ver))
+			if len(record) < 4 {
+				l.Warn("Malformed 'D' record", "record", record)
+				continue
+			}
+			dataValues := record[4:]
+			if !currentSection.SchemaInferred {
+				currentSection.RowsChecked++
+				hasBlanks := false
+				for i := 0; i < len(currentSection.Headers); i++ {
+					if i >= len(dataValues) || dataValues[i] == "" {
+						hasBlanks = true
+						break
+					}
+				}
+				mustInferNow := !hasBlanks || currentSection.RowsChecked >= cfg.SchemaRowLimit
+				if mustInferNow {
+					if hasBlanks {
+						l.Warn("Inferring schema from row with blanks", "attempt", currentSection.RowsChecked, slog.Int("limit", cfg.SchemaRowLimit))
+					} else {
+						l.Debug("Inferring schema", "attempt", currentSection.RowsChecked)
+					}
+					inferenceValues := make([]string, len(currentSection.Headers))
+					for i := range inferenceValues {
+						if i < len(dataValues) {
+							inferenceValues[i] = dataValues[i]
+						} else {
+							inferenceValues[i] = ""
+						}
+					}
+					err := currentSection.inferSchemaAndInitWriter(inferenceValues)
+					if err != nil {
+						l.Error("Failed to infer schema/init writer, skipping section.", "error", err)
+						accumulatedErrors = errors.Join(accumulatedErrors, err)
+						currentSection = nil
+						continue
+					}
+				} else {
+					l.Debug("Skipping schema inference on blank row", slog.Int("attempt", currentSection.RowsChecked))
+					continue
+				}
+			}
+
+			if currentSection != nil && currentSection.SchemaInferred {
+				// Call writeRow which now includes validation and returns specific error
+				writeErr := currentSection.writeRow(dataValues)
+				if writeErr != nil {
+					// Log the specific validation or WriteString error and accumulate it.
+					// Continue processing next row.
+					accumulatedErrors = errors.Join(accumulatedErrors, fmt.Errorf("write line %d: %w", lineNumber, writeErr))
+					l.Warn("Accumulated error processing row, continuing.", "error", writeErr) // Logged in writeRow too
+				}
+			}
+
+		default:
+			continue
+		}
+	} // End record reading loop
+
+	// --- Cleanup Block for Normal Loop Exit ---
+	if ctx.Err() == nil { // Only close normally if context wasn't cancelled
+		if currentSection != nil {
+			if err := currentSection.close(); err != nil {
+				accumulatedErrors = errors.Join(accumulatedErrors, err)
+			}
+			currentSection = nil
+		}
+	}
+
+	// Scanner errors handled in loop
+	return accumulatedErrors
+}
+
+
+##################################################
+# File: ./internal/config/config.go
+##################################################
+package config
+
+// DefaultFeedURLs lists the standard NEMWEB "Current" directories containing individual data zip files.
+// Can be overridden by the --feed-url flag.
+var DefaultFeedURLs = []string{
+	// "https://nemweb.com.au/Reports/Current/FPP/",
+	// "https://nemweb.com.au/Reports/Current/FPPDAILY/",
+	// "https://nemweb.com.au/Reports/Current/FPPRATES/",
+	"https://nemweb.com.au/Reports/Current/FPPRUN/",
+	// "https://nemweb.com.au/Reports/Current/PD7Day/",
+	// "https://nemweb.com.au/Reports/Current/P5_Reports/",
+}
+
+// DefaultArchiveFeedURLs lists the NEMWEB "Archive" directories potentially containing zip files of zip files.
+// Can be overridden by the --archive-feed-url flag.
+var DefaultArchiveFeedURLs = []string{
+	// "https://nemweb.com.au/Reports/Archive/FPPDAILY/",
+	// "https://nemweb.com.au/Reports/Archive/FPPRATES/",
+	"https://nemweb.com.au/Reports/Archive/FPPRUN/", // Contains historical FPP_RCR data
+	// "https://nemweb.com.au/Reports/Archive/P5_Reports/",
+}
+
+const (
+	// DefaultSchemaRowLimit specifies the maximum number of 'D' rows
+	// to examine within a CSV section when inferring the Parquet schema,
+	// especially when trying to find a row without blank values.
+	DefaultSchemaRowLimit = 100
+)
+
+// Config holds application settings derived from flags or a potential config file.
+type Config struct {
+	// InputDir specifies the directory where downloaded individual data zip files are stored.
+	// It's also scanned by the processor for zip files to process.
+	InputDir string
+
+	// OutputDir specifies the directory where generated Parquet files are written.
+	OutputDir string
+
+	// DbPath specifies the path to the DuckDB database file used for storing
+	// the event log history (e.g., download/process status).
+	// Can be ":memory:" for an in-memory database (state lost on exit).
+	DbPath string
+
+	// NumWorkers determines the number of concurrent goroutines used for the
+	// processing phase (unzipping and converting CSVs to Parquet).
+	// Defaults to the number of logical CPUs.
+	NumWorkers int
+
+	// FeedURLs lists the base URLs for "Current" data containing individual data zips.
+	FeedURLs []string
+
+	// ArchiveFeedURLs lists the base URLs for "Archive" data potentially containing zips of zips.
+	ArchiveFeedURLs []string
+
+	// SchemaRowLimit corresponds to DefaultSchemaRowLimit, potentially configurable later.
+	SchemaRowLimit int
+}
+
+
+##################################################
+# File: ./internal/util/http.go
+##################################################
+package util
+
+import (
+	"bytes" // Needed for bytes.Buffer
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// ProgressCallback is a function type for reporting download progress.
+// downloadedBytes: bytes downloaded so far.
+// totalBytes: total size of the file (-1 if unknown).
+type ProgressCallback func(downloadedBytes int64, totalBytes int64)
+
+// DownloadFileWithProgress executes a pre-built HTTP request, streams the body,
+// reports progress via callback, and returns the full body bytes.
+// It handles response closing and non-200 status codes.
+// The callback is invoked periodically during the download.
+func DownloadFileWithProgress(client *http.Client, req *http.Request, callback ProgressCallback) ([]byte, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http do request for %s: %w", req.URL.String(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		limitReader := io.LimitReader(resp.Body, 512)
+		bodyBytes, _ := io.ReadAll(limitReader)
+		return nil, fmt.Errorf("bad status '%s' fetching %s: %s", resp.Status, req.URL.String(), string(bodyBytes))
+	}
+
+	// Get total size from header if available
+	totalSize := resp.ContentLength // Will be -1 if unknown
+
+	// Use a buffer to store the downloaded data
+	var buf bytes.Buffer
+	buf.Grow(int(totalSize)) // Pre-allocate if size is known
+
+	// Create a progress tracking reader
+	progressReader := &progressReader{
+		Reader:         resp.Body,
+		Total:          totalSize,
+		Callback:       callback,
+		BytesRead:      0,
+		NextReportAt:   100 * 1024 * 1024, // Report every 100MB
+		ReportInterval: 100 * 1024 * 1024,
+	}
+
+	// Copy from the progress reader to the buffer
+	_, err = io.Copy(&buf, progressReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading/copying body from %s: %w", req.URL.String(), err)
+	}
+
+	// Final progress report if callback exists and total size known
+	if callback != nil && totalSize > 0 {
+		callback(totalSize, totalSize)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// progressReader wraps an io.Reader to track read progress and invoke a callback.
+type progressReader struct {
+	io.Reader
+	Callback       ProgressCallback
+	Total          int64
+	BytesRead      int64
+	NextReportAt   int64
+	ReportInterval int64
+}
+
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.Reader.Read(p)
+	if n > 0 {
+		pr.BytesRead += int64(n)
+		if pr.Callback != nil && pr.BytesRead >= pr.NextReportAt {
+			pr.Callback(pr.BytesRead, pr.Total)
+			// Set next report point, ensuring it increments even if callback was delayed
+			pr.NextReportAt = ((pr.BytesRead / pr.ReportInterval) + 1) * pr.ReportInterval
+		}
+	}
+	// Ensure final callback happens if EOF is reached and not exactly on interval
+	if err == io.EOF && pr.Callback != nil && pr.BytesRead < pr.Total {
+		pr.Callback(pr.BytesRead, pr.Total)
+	}
+	return
+}
+
+// DefaultHTTPClient creates a default http.Client with a very long timeout
+// suitable for potentially large file downloads.
+func DefaultHTTPClient() *http.Client {
+	// Set a long timeout (e.g., 1 hour) instead of infinite (0)
+	// Adjust as needed based on expected max download times.
+	return &http.Client{Timeout: 1 * time.Hour}
+}
+
+// --- Old DownloadFile (kept for reference or if needed elsewhere without progress) ---
+func DownloadFile(client *http.Client, req *http.Request) ([]byte, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http do request for %s: %w", req.URL.String(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		limitReader := io.LimitReader(resp.Body, 512)
+		bodyBytes, _ := io.ReadAll(limitReader)
+		return nil, fmt.Errorf("bad status '%s' fetching %s: %s", resp.Status, req.URL.String(), string(bodyBytes))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading body from %s: %w", req.URL.String(), err)
+	}
+	return bodyBytes, nil
+}
+
+
+##################################################
+# File: ./internal/util/datetime.go
+##################################################
+package util
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+)
+
+var (
+	nemLocation      *time.Location
+	nemDateTimeRegex *regexp.Regexp
+)
+
+func init() {
+	// Define the NEM time zone location (UTC+10)
+	nemLocation = time.FixedZone("NEM", 10*60*60) // 10 hours * 60 mins * 60 secs
+
+	// Compile the regex for date format detection
+	// Matches "YYYY/MM/DD HH:MI:SS" exactly, allowing for optional surrounding quotes.
+	nemDateTimeRegex = regexp.MustCompile(`^"?\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}"?$`)
+}
+
+// IsNEMDateTime checks if a string matches the YYYY/MM/DD HH:MI:SS format (with optional quotes).
+func IsNEMDateTime(s string) bool {
+	return nemDateTimeRegex.MatchString(s)
+}
+
+// NEMDateTimeToEpochMS converts a "YYYY/MM/DD HH:MI:SS" string (in NEMtime),
+// potentially surrounded by double quotes, to Unix epoch milliseconds (int64).
+// Returns 0 and error if parsing fails.
+func NEMDateTimeToEpochMS(s string) (int64, error) {
+	// Trim surrounding double quotes before parsing
+	trimmedS := strings.Trim(s, `"`)
+
+	// Define the layout matching the input string format (without quotes)
+	layout := "2006/01/02 15:04:05" // Go's reference time format matching YYYY/MM/DD HH:MI:SS
+	t, err := time.ParseInLocation(layout, trimmedS, nemLocation)
+	if err != nil {
+		// Return the original string 's' in the error message for better debugging
+		return 0, fmt.Errorf("failed to parse NEM time (after trimming quotes) from '%s': %w", s, err)
+	}
+	// Return milliseconds since epoch
+	return t.UnixMilli(), nil
+}
+
+// GetNEMLocation returns the fixed NEM time zone location used for parsing.
+func GetNEMLocation() *time.Location {
+	return nemLocation
+}
+
+
+##################################################
+# File: ./internal/util/parser.go
+##################################################
+package util
+
+import (
+	"strings"
+
+	"golang.org/x/net/html"
+)
+
+// ParseLinks finds links ending with a specific suffix within an HTML node tree.
+// It performs a depth-first search for <a> tags and checks their href attribute.
+func ParseLinks(n *html.Node, suffix string) []string {
+	var out []string
+	var walk func(*html.Node)
+
+	walk = func(nd *html.Node) {
+		// Check if it's an <a> element
+		if nd.Type == html.ElementNode && nd.Data == "a" {
+			// Iterate through attributes to find 'href'
+			for _, a := range nd.Attr {
+				if a.Key == "href" {
+					// Check if the href value ends with the desired suffix (case-insensitive)
+					// Also ensure it's not just a link to the root directory "/"
+					if strings.HasSuffix(strings.ToLower(a.Val), strings.ToLower(suffix)) && a.Val != "/" {
+						out = append(out, a.Val) // Add the link value to the output slice
+					}
+					// No need to check other attributes for this node once href is found
+					break
+				}
+			}
+		}
+		// Recursively walk through child nodes
+		for c := nd.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+
+	// Start the walk from the root node provided
+	walk(n)
+	return out
+}
+
+
+##################################################
+# File: ./internal/util/scanner.go
+##################################################
+package util
+
+import (
+	"bufio"
+	"context" // Keep context for potential future use (e.g., cancellation)
+	"io"
+	"strings"
+)
+
+// PeekableScanner wraps bufio.Scanner to allow peeking at the next line
+// without consuming it from the underlying scanner. This is useful for
+// looking ahead at record types in structured text files like NEM CSVs.
+type PeekableScanner struct {
+	scanner    *bufio.Scanner
+	peekedLine *string         // Stores the line read by PeekRecordType
+	peekErr    error           // Stores any error encountered during peeking
+	context    context.Context // Context for potential cancellation (not actively used yet)
+}
+
+// NewPeekableScanner creates a new PeekableScanner wrapping the given io.Reader.
+func NewPeekableScanner(r io.Reader) *PeekableScanner {
+	scanner := bufio.NewScanner(r)
+	// Default buffer size can be set here, but it's often overridden later
+	// using the Buffer method based on expected line lengths.
+	return &PeekableScanner{scanner: scanner, context: context.Background()}
+}
+
+// Scan advances the scanner to the next token (line).
+// If a line was previously peeked, this consumes the peeked line first.
+// Returns false when the scan stops, either by reaching the end of the input
+// or an error. After Scan returns false, the Err method will return any error
+// that occurred during scanning, except that if it was io.EOF, Err will return nil.
+func (ps *PeekableScanner) Scan() bool {
+	// Check context first (optional, for future cancellation integration)
+	select {
+	case <-ps.context.Done():
+		ps.peekErr = ps.context.Err() // Store context error
+		return false                  // Stop scanning
+	default:
+		// If a line was peeked, consume it now
+		if ps.peekedLine != nil {
+			ps.peekedLine = nil // Clear the peeked line
+			ps.peekErr = nil    // Clear any previous peek error
+			return true         // Indicate success (consumed peeked line)
+		}
+		// Otherwise, perform a normal scan using the underlying scanner
+		return ps.scanner.Scan()
+	}
+}
+
+// Text returns the most recent token generated by a call to Scan.
+// It returns the current line being processed or the previously peeked line
+// if Scan was just called after a PeekRecordType.
+func (ps *PeekableScanner) Text() string {
+	if ps.peekedLine != nil {
+		// If we are consuming a peeked line, return its value
+		return *ps.peekedLine
+	}
+	// Otherwise, return the text from the underlying scanner
+	return ps.scanner.Text()
+}
+
+// Err returns the first non-EOF error that was encountered by the Scanner.
+// It also returns any error encountered during peeking or context cancellation.
+func (ps *PeekableScanner) Err() error {
+	// Prioritize context or peek errors if they occurred
+	if ps.peekErr != nil {
+		return ps.peekErr
+	}
+	// Otherwise, return the underlying scanner's error
+	return ps.scanner.Err()
+}
+
+// PeekRecordType reads ahead to find the next non-empty, non-comment line
+// without consuming it from the main Scan sequence. It extracts and returns
+// the record type (the first comma-separated value) from that line.
+// Returns the record type string and any error encountered during the peek scan.
+func (ps *PeekableScanner) PeekRecordType() (string, error) {
+	// If a line is already peeked, return its type immediately
+	if ps.peekedLine != nil {
+		return ps.extractRecordType(*ps.peekedLine), ps.peekErr
+	}
+
+	// Loop to read ahead, skipping blank lines or potential comment lines
+	for ps.scanner.Scan() {
+		line := ps.scanner.Text()
+		trimmedLine := strings.TrimSpace(line)
+
+		// Skip blank lines and lines starting with common comment characters
+		if trimmedLine == "" || strings.HasPrefix(trimmedLine, "#") || strings.HasPrefix(trimmedLine, "//") {
+			continue // Read the next line
+		}
+
+		// Found a significant line, store it for peeking
+		ps.peekedLine = &line
+		ps.peekErr = nil // Clear any previous peek error
+		// Extract and return the record type from this peeked line
+		return ps.extractRecordType(line), nil
+	}
+
+	// If the loop finishes, it means scanner ended (EOF or error) without finding a suitable line
+	ps.peekErr = ps.scanner.Err() // Capture the final scanner error (might be nil if just EOF)
+	ps.peekedLine = nil           // Ensure no peeked line is stored
+	return "", ps.peekErr         // Return empty type and the error/nil
+}
+
+// extractRecordType isolates the first comma-separated value from a line,
+// trimming whitespace, to determine the record type.
+func (ps *PeekableScanner) extractRecordType(line string) string {
+	trimmedLine := strings.TrimSpace(line)
+	if trimmedLine == "" {
+		return "" // Empty line has no type
+	}
+	// Split only on the first comma
+	parts := strings.SplitN(trimmedLine, ",", 2)
+	if len(parts) > 0 {
+		// Return the first part, trimmed of any extra whitespace
+		return strings.TrimSpace(parts[0])
+	}
+	// Should not happen for a non-empty line, but return empty defensively
+	return ""
+}
+
+// Buffer sets the initial buffer size and maximum buffer size for the underlying scanner.
+// Call this after NewPeekableScanner if you need larger buffer capacity than the default.
+func (ps *PeekableScanner) Buffer(buf []byte, max int) {
+	ps.scanner.Buffer(buf, max)
+}
+
+
+##################################################
+# File: ./internal/analyser/analyser.go
+##################################################
+package analyser // Use 's' spelling
+
+import (
+	"context"
+	"database/sql"
+	"errors" // Import errors for joining
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/config"
+	"github.com/brensch/nemparquet/internal/util"
+
+	_ "github.com/marcboeker/go-duckdb"
+)
+
+// Helper function to query and log row counts for diagnostics
+func logViewRowCount(ctx context.Context, conn *sql.Conn, logger *slog.Logger, viewName, filterClause string) {
+	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s;", viewName, filterClause)
+	var count int64 = -1 // Default to -1 to indicate query failure
+	err := conn.QueryRowContext(ctx, countSQL).Scan(&count)
+	if err != nil {
+		logger.Warn("Diagnostic: Failed to get row count", slog.String("view", viewName), "error", err)
+	} else {
+		logger.Debug("Diagnostic: Row count", slog.String("view", viewName), slog.String("filter", filterClause), slog.Int64("count", count))
+	}
+}
+
+// RunAnalysis connects to DuckDB, runs FPP analysis, uses slog.
+func RunAnalysis(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	logger.Info("--- Starting DuckDB FPP Analysis ---")
+
+	db, err := sql.Open("duckdb", cfg.DbPath) // Use configured DB path
+	if err != nil {
+		return fmt.Errorf("failed to open duckdb database (%s): %w", cfg.DbPath, err)
+	}
+	defer db.Close()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get connection from pool: %w", err)
+	}
+	defer conn.Close()
+
+	logger.Debug("Installing and loading Parquet extension for analysis.")
+	setupSQL := `INSTALL parquet; LOAD parquet;`
+	if _, err := conn.ExecContext(ctx, setupSQL); err != nil {
+		logger.Warn("Failed to install/load parquet extension. Analysis might fail.", "error", err)
+	} else {
+		logger.Debug("Parquet extension loaded (or already available).")
+	}
+
+	duckdbParquetDir := strings.ReplaceAll(cfg.OutputDir, `\`, `/`)
+
+	// --- Calculate Date Range Filter ---
+	nemLocation := util.GetNEMLocation()
+	startFilterTime, startErr := time.ParseInLocation("2006/01/02 15:04:05", "2025/04/01 00:00:00", nemLocation)
+	endFilterTime, endErr := time.ParseInLocation("2006/01/02 15:04:05", "2025/04/30 23:59:59", nemLocation)
+	if startErr != nil || endErr != nil {
+		return fmt.Errorf("failed parse filter dates: start=%v, end=%v", startErr, endErr)
+	}
+	startEpochMS := startFilterTime.UnixMilli()
+	endEpochMS := endFilterTime.UnixMilli()
+	dateFilterClause := fmt.Sprintf("INTERVAL_DATETIME >= %d AND INTERVAL_DATETIME <= %d", startEpochMS, endEpochMS)
+	logger.Info("Analysis date range", slog.Time("start_nem", startFilterTime), slog.Time("end_nem", endFilterTime), slog.Int64("start_epoch_ms", startEpochMS), slog.Int64("end_epoch_ms", endEpochMS))
+
+	// --- View Definitions ---
+	createCfViewSQL := fmt.Sprintf(`CREATE OR REPLACE VIEW fpp_cf AS SELECT FPP_UNITID AS unit, INTERVAL_DATETIME, TRY_CAST(CONTRIBUTION_FACTOR AS DOUBLE) AS cf FROM read_parquet('%s/*CONTRIBUTION_FACTOR*.parquet', HIVE_PARTITIONING=0);`, duckdbParquetDir)
+	createRcrViewSQL := fmt.Sprintf(`CREATE OR REPLACE VIEW rcr AS SELECT INTERVAL_DATETIME, BIDTYPE AS SERVICE, TRY_CAST(RCR AS DOUBLE) AS rcr FROM read_parquet('%s/*FPP_RCR*.parquet', HIVE_PARTITIONING=0);`, duckdbParquetDir)
+	createPriceViewSQL := fmt.Sprintf(`CREATE OR REPLACE VIEW price AS SELECT INTERVAL_DATETIME, REGIONID, TRY_CAST(RAISEREGRRP AS DOUBLE) AS price_raisereg, TRY_CAST(LOWERREGRRP AS DOUBLE) AS price_lowerreg FROM read_parquet('%s/*PRICESOLUTION*.parquet', HIVE_PARTITIONING=0);`, duckdbParquetDir)
+
+	// Execute View Creation
+	logger.Info("Creating analysis views.")
+	if _, err = conn.ExecContext(ctx, createCfViewSQL); err != nil {
+		return fmt.Errorf("create view fpp_cf: %w", err)
+	}
+	if _, err = conn.ExecContext(ctx, createRcrViewSQL); err != nil {
+		return fmt.Errorf("create view rcr: %w", err)
+	}
+	if _, err = conn.ExecContext(ctx, createPriceViewSQL); err != nil {
+		return fmt.Errorf("create view price: %w", err)
+	}
+	logger.Debug("Analysis views created.")
+
+	// --- *** ADDED DIAGNOSTICS: Check counts in base views for the target date range *** ---
+	logger.Debug("--- Running Base View Diagnostics ---")
+	logViewRowCount(ctx, conn, logger, "fpp_cf", dateFilterClause)
+	logViewRowCount(ctx, conn, logger, "rcr", dateFilterClause)
+	logViewRowCount(ctx, conn, logger, "price", dateFilterClause)
+	logger.Debug("--- Finished Base View Diagnostics ---")
+	// --- End Added Diagnostics ---
+
+	// --- Diagnostics (Distinct SERVICE values - Unchanged) ---
+	logger.Debug("Checking distinct SERVICE values in rcr view.")
+	distinctServiceSQL := `SELECT DISTINCT SERVICE FROM rcr ORDER BY 1 NULLS LAST LIMIT 20;`
+	serviceRows, err := conn.QueryContext(ctx, distinctServiceSQL)
+	// ... (Rest of distinct SERVICE logging unchanged) ...
+	if err != nil {
+		logger.Warn("Failed query distinct service values", "error", err)
+	} else {
+		var services []string
+		for serviceRows.Next() {
+			var s sql.NullString
+			if scanErr := serviceRows.Scan(&s); scanErr == nil {
+				if s.Valid {
+					services = append(services, s.String)
+				} else {
+					services = append(services, "NULL")
+				}
+			} else {
+				logger.Warn("Failed scanning distinct service value", "error", scanErr)
+			}
+		}
+		serviceRows.Close()
+		logger.Debug("Distinct SERVICE values found", slog.Any("values_sample", services))
+		contains := func(slice []string, val string) bool {
+			for _, item := range slice {
+				if item == val {
+					return true
+				}
+			}
+			return false
+		}
+		if len(services) > 0 && (!contains(services, "RAISEREG") || !contains(services, "LOWERREG")) {
+			logger.Warn("Expected SERVICE values 'RAISEREG' or 'LOWERREG' might be missing from sample.")
+		} else if len(services) == 0 {
+			logger.Warn("No SERVICE values found in rcr view sample. Joins might yield no results.")
+		}
+	}
+
+	// --- Diagnostics (Epoch date ranges - Unchanged) ---
+	logger.Debug("Checking epoch date ranges (INT64) in views.")
+	epochCheckSQL := `...` // Same SQL as before
+	epochRows, err := conn.QueryContext(ctx, epochCheckSQL)
+	// ... (Rest of epoch range logging unchanged) ...
+	if err != nil {
+		logger.Warn("Failed query epoch date ranges", "error", err)
+	} else {
+		logger.Debug("Epoch Date Range Check Results (from sample):")
+		for epochRows.Next() {
+			var tbl sql.NullString
+			var sCnt sql.NullInt64
+			var minE, maxE sql.NullInt64
+			if scanErr := epochRows.Scan(&tbl, &sCnt, &minE, &maxE); scanErr != nil {
+				logger.Warn("Error scanning epoch range row", "error", scanErr)
+				break
+			}
+			minTsUTC := time.Unix(0, 0)
+			maxTsUTC := time.Unix(0, 0)
+			if minE.Valid {
+				minTsUTC = time.UnixMilli(minE.Int64).UTC()
+			}
+			if maxE.Valid {
+				maxTsUTC = time.UnixMilli(maxE.Int64).UTC()
+			}
+			logger.Debug("Range", slog.String("table", tbl.String), slog.Int64("sample_count", sCnt.Int64), slog.Int64("min_epoch_ms", minE.Int64), slog.Int64("max_epoch_ms", maxE.Int64), slog.Time("min_ts_utc", minTsUTC), slog.Time("max_ts_utc", maxTsUTC))
+		}
+		epochRows.Close()
+	}
+
+	// --- FPP Calculation View ---
+	calculateFppSQL := `
+    CREATE OR REPLACE VIEW fpp_combined AS
+    SELECT cf.unit, cf.INTERVAL_DATETIME, cf.cf, r.rcr, r.SERVICE,
+        COALESCE(p.price_raisereg, 0.0) AS price_raisereg,
+        COALESCE(p.price_lowerreg, 0.0) AS price_lowerreg,
+        CASE UPPER(r.SERVICE) WHEN 'RAISEREG' THEN COALESCE(p.price_raisereg, 0.0) WHEN 'LOWERREG' THEN COALESCE(p.price_lowerreg, 0.0) ELSE 0.0 END AS service_price,
+        COALESCE(cf.cf, 0.0) * COALESCE(r.rcr, 0.0) * CASE UPPER(r.SERVICE) WHEN 'RAISEREG' THEN COALESCE(p.price_raisereg, 0.0) WHEN 'LOWERREG' THEN COALESCE(p.price_lowerreg, 0.0) ELSE 0.0 END AS fpp_cost
+    FROM fpp_cf cf
+    JOIN rcr r ON cf.INTERVAL_DATETIME = r.INTERVAL_DATETIME
+    JOIN price p ON cf.INTERVAL_DATETIME = p.INTERVAL_DATETIME
+    WHERE UPPER(r.SERVICE) IN ('RAISEREG', 'LOWERREG');`
+	logger.Info("Calculating combined FPP view.")
+	if _, err = conn.ExecContext(ctx, calculateFppSQL); err != nil {
+		return fmt.Errorf("calculate combined FPP view: %w", err)
+	}
+	logger.Debug("Combined FPP view created.")
+
+	// --- *** ADDED DIAGNOSTICS: Check counts in combined view *** ---
+	logger.Debug("--- Running Combined View Diagnostics ---")
+	logViewRowCount(ctx, conn, logger, "fpp_combined", "1=1")            // Count before date filter
+	logViewRowCount(ctx, conn, logger, "fpp_combined", dateFilterClause) // Count after date filter
+	logger.Debug("--- Finished Combined View Diagnostics ---")
+	// --- End Added Diagnostics ---
+
+	// --- Aggregation ---
+	logger.Info("Aggregating FPP results for filter period.") // Log message moved down slightly
+
+	aggregateFppSQL := fmt.Sprintf(`
+    SELECT unit,
+        SUM(CASE WHEN UPPER(SERVICE) = 'RAISEREG' THEN fpp_cost ELSE 0 END) AS total_raise_fpp,
+        SUM(CASE WHEN UPPER(SERVICE) = 'LOWERREG' THEN fpp_cost ELSE 0 END) AS total_lower_fpp,
+        SUM(fpp_cost) AS total_fpp
+    FROM fpp_combined WHERE %s
+    GROUP BY unit ORDER BY unit;`, dateFilterClause) // Use dateFilterClause variable
+
+	rows, err := conn.QueryContext(ctx, aggregateFppSQL)
+	if err != nil {
+		return fmt.Errorf("execute final FPP aggregation: %w", err)
+	}
+	defer rows.Close()
+
+	logger.Info("--- FPP Calculation Results (April 2025 NEM Time) ---")
+	fmt.Println("--- FPP Results ---")
+	fmt.Printf("%-20s | %-20s | %-20s | %-20s\n", "Unit", "Total Raise FPP", "Total Lower FPP", "Total FPP")
+	fmt.Println(strings.Repeat("-", 85))
+
+	rowCount := 0
+	var analysisErrors error
+	for rows.Next() { // ... (Result scanning/printing unchanged) ...
+		var unit string
+		var totalRaise, totalLower, totalFpp sql.NullFloat64
+		if scanErr := rows.Scan(&unit, &totalRaise, &totalLower, &totalFpp); scanErr != nil {
+			logger.Error("Failed to scan result row", "error", scanErr)
+			analysisErrors = errors.Join(analysisErrors, fmt.Errorf("scan result: %w", scanErr))
+			continue
+		}
+		printFloat := func(f sql.NullFloat64) string {
+			if f.Valid {
+				return fmt.Sprintf("%.4f", f.Float64)
+			}
+			return "NULL"
+		}
+		logger.Debug("FPP Result Row", slog.String("unit", unit), slog.Float64("raise_fpp", totalRaise.Float64), slog.Float64("lower_fpp", totalLower.Float64), slog.Float64("total_fpp", totalFpp.Float64), slog.Bool("raise_valid", totalRaise.Valid), slog.Bool("lower_valid", totalLower.Valid), slog.Bool("total_valid", totalFpp.Valid))
+		fmt.Printf("%-20s | %-20s | %-20s | %-20s\n", unit, printFloat(totalRaise), printFloat(totalLower), printFloat(totalFpp))
+		rowCount++
+	}
+	if err = rows.Err(); err != nil {
+		analysisErrors = errors.Join(analysisErrors, fmt.Errorf("iterate results: %w", err))
+	}
+	fmt.Println(strings.Repeat("-", 85))
+
+	if rowCount == 0 {
+		logger.Warn("No FPP results found for the specified date range.") // Warning remains
+		fmt.Println("No FPP results found for the specified date range.")
+	} else {
+		logger.Info("Analysis results generated.", slog.Int("result_rows", rowCount))
+	}
+	logger.Info("--- DuckDB FPP Analysis Finished ---")
+
+	if analysisErrors != nil {
+		logger.Warn("Analysis completed with errors during result processing.", "error", analysisErrors)
+	}
+	return analysisErrors
+}
+
+
+##################################################
+# File: ./internal/orchestrator/run.go
+##################################################
+package orchestrator
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/config"
+	"github.com/brensch/nemparquet/internal/db"
+	"github.com/brensch/nemparquet/internal/downloader"
+	"github.com/brensch/nemparquet/internal/processor"
+	"github.com/brensch/nemparquet/internal/util"
+
+	"golang.org/x/sync/semaphore" // Import semaphore for inner extraction
+)
+
+// RunCombinedWorkflow orchestrates the download and process sequence.
+// Flow: Start processors -> Process Archives (Download->Extract->Queue Inner) -> Process Current (Download->Queue) -> Wait
+func RunCombinedWorkflow(ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger, forceDownload, forceProcess bool) error {
+	logger.Info("Starting combined workflow (Strict Phases)...")
+	client := util.DefaultHTTPClient()
+	var finalErr error
+
+	// Channel for paths to be processed
+	processingJobsChan := make(chan string, cfg.NumWorkers*4)
+	var processorWg sync.WaitGroup
+	var processorErrors sync.Map
+
+	// --- Phase 1: Start Processing Workers ---
+	logger.Info("Phase 1: Starting processor workers.", slog.Int("workers", cfg.NumWorkers))
+	processor.StartProcessorWorkers(
+		ctx, cfg, dbConn, logger,
+		cfg.NumWorkers, processingJobsChan,
+		&processorWg, &processorErrors,
+		forceProcess,
+	)
+
+	// --- Ensure processor channel is closed and workers are waited for on exit ---
+	defer func() {
+		logger.Info("Closing processor channel and waiting for workers...")
+		close(processingJobsChan)
+		processorWg.Wait()
+		logger.Info("All processor workers finished.")
+		processorErrorCount := 0
+		processorErrors.Range(func(key, value interface{}) bool {
+			path := key.(string)
+			err := value.(error)
+			logger.Warn("Processor worker error recorded", slog.String("path", path), slog.Any("error", err))
+			// Join processor errors into finalErr *after* main logic returns
+			// For now, just log them here.
+			processorErrorCount++
+			return true
+		})
+		if processorErrorCount > 0 {
+			logger.Warn("Processing phase completed with errors.", slog.Int("error_count", processorErrorCount))
+		}
+		// Final success log depends on finalErr state after this defer potentially modifies it
+	}() // End defer
+
+	// --- Phase 2: Discover All Potential Zip URLs ---
+	logger.Info("Phase 2: Discovering all potential ZIP URLs...")
+	currentURLsMap, currentDiscoveryErr := downloader.DiscoverZipURLs(ctx, cfg.FeedURLs, logger)
+	archiveURLsMap, archiveDiscoveryErr := downloader.DiscoverZipURLs(ctx, cfg.ArchiveFeedURLs, logger)
+	discoveryErr := errors.Join(currentDiscoveryErr, archiveDiscoveryErr)
+	if discoveryErr != nil {
+		logger.Error("Errors during discovery phase.", "error", discoveryErr)
+		finalErr = errors.Join(finalErr, discoveryErr)
+	}
+	if ctx.Err() != nil {
+		return errors.Join(finalErr, ctx.Err())
+	} // Check context after discovery
+
+	allDiscoveredURLs := make([]string, 0, len(currentURLsMap)+len(archiveURLsMap))
+	urlToSourceMap := make(map[string]string)
+	urlIsArchive := make(map[string]bool)
+	for url, source := range currentURLsMap {
+		if _, exists := urlToSourceMap[url]; !exists {
+			allDiscoveredURLs = append(allDiscoveredURLs, url)
+			urlToSourceMap[url] = source
+			urlIsArchive[url] = false
+		}
+	}
+	for url, source := range archiveURLsMap {
+		if _, exists := urlToSourceMap[url]; !exists {
+			allDiscoveredURLs = append(allDiscoveredURLs, url)
+			urlToSourceMap[url] = source
+			urlIsArchive[url] = true
+		} else {
+			logger.Warn("URL discovered in both current and archive feeds, treating as current.", "url", url)
+		}
+	}
+	sort.Strings(allDiscoveredURLs)
+	if len(allDiscoveredURLs) == 0 {
+		logger.Info("No zip URLs discovered. Workflow finished.")
+		return discoveryErr
+	}
+	logger.Info("Discovery complete.", slog.Int("total_unique_zips", len(allDiscoveredURLs)))
+
+	// --- Phase 3: Determine Initial Work Items from DB ---
+	logger.Info("Phase 3: Determining initial work items from database...")
+	initialPathsToProcess, dbErr := db.GetPathsToProcess(ctx, dbConn)
+	if dbErr != nil {
+		return errors.Join(finalErr, fmt.Errorf("failed get initial paths to process: %w", dbErr))
+	}
+	if ctx.Err() != nil {
+		return errors.Join(finalErr, ctx.Err())
+	}
+	logger.Info("Initial processing check complete.", slog.Int("paths_to_process_initially", len(initialPathsToProcess)))
+
+	// --- Phase 4: Queue Initial Processing Jobs ---
+	if !forceProcess {
+		logger.Info("Phase 4: Queueing initially identified paths for processing.", slog.Int("count", len(initialPathsToProcess)))
+		initialJobsSent := 0
+		queueLoopCtx, cancelQueueLoop := context.WithCancel(ctx)
+		queueDone := make(chan struct{})
+		go func() {
+			defer close(queueDone)
+			defer cancelQueueLoop()
+			for _, path := range initialPathsToProcess {
+				if _, statErr := os.Stat(path); statErr != nil {
+					logger.Warn("Initial process path missing on disk, skipping queue.", "path", path, "error", statErr)
+					continue
+				}
+				select {
+				case <-queueLoopCtx.Done():
+					logger.Warn("Initial queuing cancelled.")
+					return
+				case processingJobsChan <- path:
+					initialJobsSent++
+				}
+			}
+			logger.Debug("Finished queuing all initial paths naturally.")
+		}()
+		<-queueDone
+		logger.Info("Initial processing jobs queued.", slog.Int("queued_count", initialJobsSent))
+	} else {
+		logger.Info("Phase 4: Skipping initial path queueing because force-process is enabled.")
+	}
+	if ctx.Err() != nil {
+		return errors.Join(finalErr, ctx.Err())
+	}
+
+	// --- Phase 5: Sequential Download/Extract, Feeding Processors ---
+	logger.Info("Phase 5: Starting sequential download/extract process for all discovered URLs...", slog.Int("total_urls", len(allDiscoveredURLs)))
+	downloadCompletedMap, dbErr := db.GetCompletionStatusBatch(ctx, dbConn, allDiscoveredURLs, db.FileTypeZip, db.EventDownloadEnd)
+	if dbErr != nil {
+		logger.Error("DB error checking download status batch.", "error", dbErr)
+		finalErr = errors.Join(finalErr, dbErr)
+		downloadCompletedMap = make(map[string]bool)
+	}
+	outerArchiveCompletedMap, dbErr := db.GetCompletionStatusBatch(ctx, dbConn, allDiscoveredURLs, db.FileTypeOuterArchive, db.EventProcessEnd)
+	if dbErr != nil {
+		logger.Error("DB error checking outer archive process status.", "error", dbErr)
+		finalErr = errors.Join(finalErr, dbErr)
+		outerArchiveCompletedMap = make(map[string]bool)
+	}
+	if ctx.Err() != nil {
+		return errors.Join(finalErr, ctx.Err())
+	}
+
+	processedURLCount := 0
+	downloadErrorCount := 0
+	skippedDownloadCount := 0
+
+downloadLoop: // Label for breaking outer loop on context cancellation
+	for _, currentURL := range allDiscoveredURLs {
+		select {
+		case <-ctx.Done():
+			logger.Warn("Workflow cancelled during download/extract loop.")
+			finalErr = errors.Join(finalErr, ctx.Err())
+			break downloadLoop
+		default:
+		} // Break outer loop
+		processedURLCount++
+		isOuterArchive := urlIsArchive[currentURL]
+		fileTypeForLog := db.FileTypeZip
+		if isOuterArchive {
+			fileTypeForLog = db.FileTypeOuterArchive
+		}
+		l := logger.With(slog.String("url", currentURL), slog.String("type", fileTypeForLog), slog.Int("url_num", processedURLCount), slog.Int("total_urls", len(allDiscoveredURLs)))
+
+		// Check skips
+		shouldSkip := false
+		if isOuterArchive {
+			if _, processed := outerArchiveCompletedMap[currentURL]; processed && !forceProcess && !forceDownload {
+				l.Info("Skipping outer archive, already processed.")
+				db.LogFileEvent(ctx, dbConn, currentURL, fileTypeForLog, db.EventSkipProcess, "", "", "Already processed", "", nil)
+				shouldSkip = true
+			}
+		} else {
+			if _, downloaded := downloadCompletedMap[currentURL]; downloaded && !forceDownload {
+				l.Info("Skipping regular zip download, already completed.")
+				db.LogFileEvent(ctx, dbConn, currentURL, fileTypeForLog, db.EventSkipDownload, urlToSourceMap[currentURL], "", "Already downloaded", "", nil)
+				shouldSkip = true
+				absPath, err := filepath.Abs(filepath.Join(cfg.InputDir, filepath.Base(currentURL)))
+				if err != nil {
+					l.Warn("Cannot get absolute path for skipped download, cannot queue.", "error", err)
+				} else if _, statErr := os.Stat(absPath); statErr == nil {
+					l.Info("Queueing previously downloaded zip for processing check.", slog.String("path", absPath))
+					select {
+					case processingJobsChan <- absPath:
+					case <-ctx.Done():
+						finalErr = errors.Join(finalErr, ctx.Err())
+						break downloadLoop
+					}
+				} else {
+					l.Warn("Skipped download file missing locally, cannot queue.", "path", absPath, "error", statErr)
+				}
+			}
+		}
+		if shouldSkip {
+			skippedDownloadCount++
+			continue
+		}
+
+		// Perform Download
+		l.Info("Starting download.")
+		startTime := time.Now()
+		db.LogFileEvent(ctx, dbConn, currentURL, fileTypeForLog, db.EventDownloadStart, urlToSourceMap[currentURL], "", "", "", nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", currentURL, nil)
+		if err != nil {
+			l.Error("Failed create request.", "error", err)
+			finalErr = errors.Join(finalErr, err)
+			downloadErrorCount++
+			continue
+		}
+		req.Header.Set("User-Agent", downloader.GetRandomUserAgent())
+		req.Header.Set("Accept", "*/*")
+		var downloadedData []byte
+		var downloadErr error
+		if isOuterArchive {
+			l.Debug("Using streaming download for outer archive.")
+			progressCallback := func(dlBytes int64, totalBytes int64) {
+				if totalBytes > 0 {
+					l.Info("Download progress", slog.Int64("dl_mb", dlBytes/(1<<20)), slog.Int64("tot_mb", totalBytes/(1<<20)), slog.Float64("pct", float64(dlBytes)*100.0/float64(totalBytes)))
+				} else {
+					l.Info("Download progress", slog.Int64("dl_mb", dlBytes/(1<<20)))
+				}
+			}
+			downloadedData, downloadErr = util.DownloadFileWithProgress(client, req, progressCallback)
+		} else {
+			downloadedData, downloadErr = util.DownloadFile(client, req)
+		}
+		downloadDuration := time.Since(startTime)
+		if downloadErr != nil {
+			l.Error("Download failed.", "error", downloadErr)
+			db.LogFileEvent(ctx, dbConn, currentURL, fileTypeForLog, db.EventError, urlToSourceMap[currentURL], "", fmt.Sprintf("download failed: %v", downloadErr), "", &downloadDuration)
+			finalErr = errors.Join(finalErr, downloadErr)
+			downloadErrorCount++
+			continue
+		}
+		db.LogFileEvent(ctx, dbConn, currentURL, fileTypeForLog, db.EventDownloadEnd, urlToSourceMap[currentURL], "", "", "", &downloadDuration)
+		l.Info("Download complete.", slog.Int("bytes", len(downloadedData)))
+
+		// Handle downloaded data
+		if isOuterArchive {
+			l.Info("Processing inner files within outer archive.")
+			extractErr := processInnerArchiveFiles(ctx, cfg, dbConn, l, currentURL, downloadedData, forceDownload, processingJobsChan) // Pass channel
+			processDuration := time.Since(startTime)
+			if extractErr != nil {
+				if errors.Is(extractErr, context.Canceled) || errors.Is(extractErr, context.DeadlineExceeded) {
+					l.Warn("Inner archive processing cancelled.")
+					finalErr = errors.Join(finalErr, extractErr)
+					break downloadLoop
+				} // Break outer loop
+				l.Error("Errors processing inner files.", "error", extractErr)
+				db.LogFileEvent(ctx, dbConn, currentURL, db.FileTypeOuterArchive, db.EventError, "", "", fmt.Sprintf("inner processing error: %v", extractErr), "", &processDuration)
+				finalErr = errors.Join(finalErr, extractErr)
+			} else {
+				l.Info("Successfully processed inner files (extracted/queued).")
+				db.LogFileEvent(ctx, dbConn, currentURL, db.FileTypeOuterArchive, db.EventProcessEnd, "", "", "Inner files extracted/queued", "", &processDuration)
+			}
+		} else {
+			zipFilename := filepath.Base(currentURL)
+			outputZipPath := filepath.Join(cfg.InputDir, zipFilename)
+			absOutputZipPath, absErr := filepath.Abs(outputZipPath)
+			if absErr != nil {
+				l.Error("Cannot get absolute path for saving zip", "error", absErr)
+				finalErr = errors.Join(finalErr, absErr)
+				downloadErrorCount++
+				continue
+			}
+			l.Debug("Saving downloaded data zip.", slog.String("path", absOutputZipPath))
+			err = os.WriteFile(absOutputZipPath, downloadedData, 0644)
+			saveDuration := time.Since(startTime)
+			if err != nil {
+				saveErr := fmt.Errorf("failed save zip %s: %w", absOutputZipPath, err)
+				db.LogFileEvent(ctx, dbConn, currentURL, db.FileTypeZip, db.EventError, urlToSourceMap[currentURL], absOutputZipPath, saveErr.Error(), "", &saveDuration)
+				logger.Error("Failed saving zip.", "error", saveErr)
+				finalErr = errors.Join(finalErr, saveErr)
+				downloadErrorCount++
+				continue
+			}
+			db.LogFileEvent(ctx, dbConn, currentURL, db.FileTypeZip, "save_end", urlToSourceMap[currentURL], absOutputZipPath, "", "", &saveDuration)
+			l.Info("Successfully saved zip.", slog.String("path", absOutputZipPath))
+			select {
+			case processingJobsChan <- absOutputZipPath:
+				l.Debug("Sent path to processor channel.", slog.String("path", absOutputZipPath))
+			case <-ctx.Done():
+				logger.Warn("Cancelled while sending downloaded path.")
+				finalErr = errors.Join(finalErr, ctx.Err())
+				break downloadLoop
+			} // Break outer loop
+		}
+	} // End download loop
+
+	// --- Phase 6: Shutdown and Wait ---
+	logger.Info("Phase 6: Download/queueing loop finished.")
+	// The defer function handles closing the channel and waiting for workers.
+
+	// Consolidate final errors *after* defer runs
+	// Need to capture processor errors from the map *before* returning finalErr
+	processorErrorCount := 0
+	processorErrors.Range(func(key, value interface{}) bool {
+		path := key.(string)
+		err := value.(error)
+		finalErr = errors.Join(finalErr, fmt.Errorf("process %s: %w", filepath.Base(path), err))
+		processorErrorCount++
+		return true
+	})
+	if processorErrorCount > 0 {
+		logger.Warn("Processing completed with errors.", slog.Int("error_count", processorErrorCount))
+	} else if finalErr == nil {
+		logger.Info("Processing completed successfully.")
+	}
+
+	logger.Info("Combined workflow finished.")
+	return finalErr // Return final accumulated error state
+}
+
+// processInnerArchiveFiles handles extracting, saving, and queueing needed inner zip files concurrently.
+func processInnerArchiveFiles(
+	ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger,
+	outerArchiveURL string, outerZipData []byte, forceDownload bool,
+	processingJobsChan chan<- string,
+) error { // Return only aggregated error
+
+	l := logger.With(slog.String("outer_archive_url", outerArchiveURL))
+	l.Debug("Opening outer archive from memory.")
+	zipReader, err := zip.NewReader(bytes.NewReader(outerZipData), int64(len(outerZipData)))
+	if err != nil {
+		l.Error("Failed create zip reader.", "error", err)
+		return fmt.Errorf("zip.NewReader %s: %w", outerArchiveURL, err)
+	}
+
+	innerZipFiles := []*zip.File{}
+	innerZipIdentifiers := []string{}
+	for _, f := range zipReader.File { /* ... find inner zips ... */
+		select {
+		case <-ctx.Done():
+			l.Warn("Cancelled inner scan.")
+			return ctx.Err()
+		default:
+		}
+		if !f.FileInfo().IsDir() && strings.EqualFold(filepath.Ext(f.Name), ".zip") {
+			innerZipFiles = append(innerZipFiles, f)
+			innerZipIdentifiers = append(innerZipIdentifiers, filepath.Base(f.Name))
+		}
+	}
+	if len(innerZipFiles) == 0 {
+		l.Info("No inner zip files found.")
+		return nil
+	}
+	l.Info("Found inner zip files.", slog.Int("count", len(innerZipFiles)))
+
+	l.Debug("Checking DB status for inner zip files...")
+	innerDownloadedMap, dbErr := db.GetCompletionStatusBatch(ctx, dbConn, innerZipIdentifiers, db.FileTypeZip, db.EventDownloadEnd)
+	if dbErr != nil {
+		l.Error("DB error checking inner status, proceeding cautiously.", "error", dbErr)
+		innerDownloadedMap = make(map[string]bool)
+	} // Log error, proceed
+
+	var innerErrors sync.Map // Use sync.Map for concurrent error storage
+	var extractedCount atomic.Int32
+	var skippedCount atomic.Int32
+	var queuedCount atomic.Int32
+	var innerWg sync.WaitGroup
+	concurrencyLimit := int64(cfg.NumWorkers / 2)
+	if concurrencyLimit < 1 {
+		concurrencyLimit = 1
+	}
+	if concurrencyLimit > 8 {
+		concurrencyLimit = 8
+	}
+	innerSem := semaphore.NewWeighted(concurrencyLimit)
+	l.Debug("Starting concurrent extraction/save.", slog.Int64("concurrency", concurrencyLimit))
+
+	innerLoopCtx, cancelInnerLoop := context.WithCancel(ctx) // Context to cancel inner goroutines early
+	defer cancelInnerLoop()                                  // Ensure cancellation signal propagates if outer context isn't cancelled first
+
+	for _, fPtr := range innerZipFiles {
+		f := fPtr // Capture loop variable
+
+		// Check context before potentially blocking on semaphore or dispatching
+		select {
+		case <-innerLoopCtx.Done():
+			l.Warn("Cancelled before processing next inner file.")
+			break
+		default:
+		} // Break loop if cancelled
+
+		innerZipName := filepath.Base(f.Name)
+		innerLogger := l.With(slog.String("inner_zip", innerZipName))
+		outputZipPath := filepath.Join(cfg.InputDir, innerZipName)
+		absOutputZipPath, absErr := filepath.Abs(outputZipPath)
+		if absErr != nil {
+			innerLogger.Error("Cannot get absolute path, skipping inner zip.", "error", absErr)
+			innerErrors.Store(innerZipName, absErr)
+			continue
+		}
+
+		// Check if inner zip download needs to be skipped
+		if _, completed := innerDownloadedMap[innerZipName]; completed && !forceDownload {
+			innerLogger.Debug("Skipping inner zip extraction, already downloaded.")
+			skippedCount.Add(1)
+			if _, statErr := os.Stat(absOutputZipPath); statErr == nil {
+				innerLogger.Info("Queueing previously downloaded inner zip.", slog.String("path", absOutputZipPath))
+				select {
+				case processingJobsChan <- absOutputZipPath:
+					queuedCount.Add(1)
+				case <-innerLoopCtx.Done():
+					break
+				} // Break loop if cancelled
+			} else {
+				innerLogger.Warn("Skipped inner zip missing locally, cannot queue.", "path", absOutputZipPath, "error", statErr)
+			}
+			continue
+		}
+
+		// Acquire semaphore
+		if err := innerSem.Acquire(innerLoopCtx, 1); err != nil {
+			innerLogger.Error("Failed acquire semaphore (context cancelled?)", "error", err)
+			innerErrors.Store(innerZipName, err)
+			break
+		} // Break loop
+
+		// Launch goroutine
+		innerWg.Add(1)
+		go func(file *zip.File, log *slog.Logger, outPathAbs string) {
+			defer innerWg.Done()
+			defer innerSem.Release(1)
+			// Check context at start of goroutine too
+			if innerLoopCtx.Err() != nil {
+				return
+			}
+
+			log.Info("Extracting and saving inner zip.")
+			extractStartTime := time.Now()
+			db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventDownloadStart, outerArchiveURL, outPathAbs, "", "", nil)
+			rc, err := file.Open()
+			if err != nil {
+				extractErr := fmt.Errorf("open inner %s: %w", innerZipName, err)
+				log.Error("Failed open inner stream.", "error", extractErr)
+				innerErrors.Store(innerZipName, extractErr)
+				db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventError, outerArchiveURL, outPathAbs, extractErr.Error(), "", nil)
+				return
+			}
+			defer rc.Close()
+			outFile, err := os.Create(outPathAbs)
+			if err != nil {
+				extractErr := fmt.Errorf("create file %s: %w", outPathAbs, err)
+				log.Error("Failed create output file.", "error", extractErr)
+				innerErrors.Store(innerZipName, extractErr)
+				db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventError, outerArchiveURL, outPathAbs, extractErr.Error(), "", nil)
+				return
+			}
+			defer func() {
+				if cerr := outFile.Close(); cerr != nil {
+					log.Warn("Error closing output file.", "error", cerr)
+					innerErrors.Store(innerZipName+"_close", cerr)
+				}
+			}()
+			_, err = io.Copy(outFile, rc)
+			extractDuration := time.Since(extractStartTime)
+			if err != nil {
+				extractErr := fmt.Errorf("copy inner %s: %w", innerZipName, err)
+				log.Error("Failed copy inner zip.", "error", extractErr)
+				os.Remove(outPathAbs)
+				innerErrors.Store(innerZipName, extractErr)
+				db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventError, outerArchiveURL, outPathAbs, extractErr.Error(), "", &extractDuration)
+				return
+			}
+
+			log.Debug("Inner zip extracted.", slog.Duration("duration", extractDuration.Round(time.Millisecond)))
+			extractedCount.Add(1)
+			db.LogFileEvent(ctx, dbConn, innerZipName, db.FileTypeZip, db.EventDownloadEnd, outerArchiveURL, outPathAbs, "", "", &extractDuration)
+
+			select {
+			case processingJobsChan <- outPathAbs:
+				log.Debug("Sent extracted path to processor channel.", slog.String("path", outPathAbs))
+				queuedCount.Add(1)
+			case <-innerLoopCtx.Done():
+				logger.Warn("Cancelled while sending extracted path.")
+				innerErrors.Store(innerZipName+"_queue_cancel", innerLoopCtx.Err())
+			}
+		}(f, innerLogger, absOutputZipPath)
+
+	} // End loop dispatching inner zips
+
+	// Wait for all extraction goroutines for *this specific outer archive* to complete
+	innerWg.Wait()
+	l.Info("Finished processing inner files.", slog.Int("extracted", int(extractedCount.Load())), slog.Int("skipped", int(skippedCount.Load())), slog.Int("queued_for_processing", int(queuedCount.Load())))
+
+	// Consolidate errors from the sync.Map for *this archive*
+	var aggregatedInnerError error
+	innerErrors.Range(func(key, value interface{}) bool {
+		filename := key.(string)
+		err := value.(error)
+		aggregatedInnerError = errors.Join(aggregatedInnerError, fmt.Errorf("%s: %w", filename, err))
+		return true
+	})
+
+	// Log a single summary event for the outer archive's extraction phase
+	finalMessage := fmt.Sprintf("Inner file processing summary: Extracted=%d, Skipped=%d, Queued=%d", extractedCount.Load(), skippedCount.Load(), queuedCount.Load())
+	if aggregatedInnerError != nil {
+		finalMessage += fmt.Sprintf(", Errors Encountered: %v", aggregatedInnerError)
+		db.LogFileEvent(ctx, dbConn, outerArchiveURL, db.FileTypeOuterArchive, db.EventError, "", "", finalMessage, "", nil)
+	} else { /* Log outer archive process end event only if NO inner errors? Or log it anyway? Let's log it anyway to signify this phase finished. */
+		db.LogFileEvent(ctx, dbConn, outerArchiveURL, db.FileTypeOuterArchive, db.EventProcessEnd, "", "", finalMessage, "", nil)
+	} // Log outer archive process end here
+
+	return aggregatedInnerError // Return aggregated errors from this archive's inner processing
+}
+
+// errorCount helper
+func errorCount(err error) int {
+	if err == nil {
+		return 0
+	}
+	var multiErr interface{ Unwrap() []error }
+	if errors.As(err, &multiErr) {
+		return len(multiErr.Unwrap())
+	}
+	return 1
+}
+
+
+##################################################
+# File: ./internal/db/state.go
+##################################################
+package db
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os" // Needed for os.Stat in GetPathsToProcess
+	"path/filepath"
+	"strings"
+	"time"
+
+	_ "github.com/marcboeker/go-duckdb" // Driver
+	// "github.com/lib/pq" // No longer needed
+)
+
+// Constants for event types
+const (
+	EventDiscovered    = "discovered"
+	EventDownloadStart = "download_start"
+	EventDownloadEnd   = "download_end"
+	EventExtractStart  = "extract_start" // Kept for potential future use, but not used in current workflow
+	EventExtractEnd    = "extract_end"   // Kept for potential future use, but not used in current workflow
+	EventProcessStart  = "process_start"
+	EventProcessEnd    = "process_end"
+	EventError         = "error"
+	EventSkipDownload  = "skip_download"
+	EventSkipExtract   = "skip_extract" // Kept for potential future use
+	EventSkipProcess   = "skip_process"
+)
+
+// Constants for file types
+const (
+	FileTypeZip          = "zip"           // Represents an individual data zip file (inner or current)
+	FileTypeCsv          = "csv"           // Represents a specific CSV section (less used for state now)
+	FileTypeOuterArchive = "outer_archive" // Represents the main archive zip containing other zips
+)
+
+// Schema SQL
+const schemaSequenceSQL = `CREATE SEQUENCE IF NOT EXISTS event_log_id_seq;`
+const schemaTableSQL = `
+CREATE TABLE IF NOT EXISTS nem_event_log (
+    log_id          BIGINT PRIMARY KEY DEFAULT nextval('event_log_id_seq'),
+    filename        VARCHAR NOT NULL,      -- Identifier: zip URL, inner zip name, or outer archive URL
+    filetype        VARCHAR NOT NULL,      -- 'zip', 'csv', 'outer_archive'
+    event           VARCHAR NOT NULL,
+    event_timestamp TIMESTAMP NOT NULL,
+    source_url      VARCHAR,               -- e.g., outer archive URL for an inner zip event
+    output_path     VARCHAR,               -- Path where inner zip was saved or parquet generated
+    message         VARCHAR,
+    sha256_hash     VARCHAR,
+    duration_ms     BIGINT
+);
+-- Indices
+CREATE INDEX IF NOT EXISTS idx_nem_event_log_file ON nem_event_log (filename, filetype);
+CREATE INDEX IF NOT EXISTS idx_nem_event_log_event_time ON nem_event_log (event, event_timestamp);
+CREATE INDEX IF NOT EXISTS idx_nem_event_log_output_path ON nem_event_log (output_path);
+`
+
+// InitializeSchema creates the sequence and tables in the correct order.
+func InitializeSchema(db *sql.DB) error {
+	// 1. Create Sequence First
+	_, err := db.Exec(schemaSequenceSQL)
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+		return fmt.Errorf("failed to execute sequence setup: %w", err)
+	}
+	// 2. Create Table and Indices
+	_, err = db.Exec(schemaTableSQL)
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+		return fmt.Errorf("failed to execute table/index setup: %w", err)
+	}
+	return nil
+}
+
+// LogFileEvent inserts a new event record into the log.
+func LogFileEvent(ctx context.Context, db *sql.DB, filename, filetype, event, sourceURL, outputPath, message, sha256 string, duration *time.Duration) error {
+	query := `
+        INSERT INTO nem_event_log (filename, filetype, event, event_timestamp, source_url, output_path, message, sha256_hash, duration_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    `
+	var durationMs sql.NullInt64
+	if duration != nil {
+		durationMs = sql.NullInt64{Int64: duration.Milliseconds(), Valid: true}
+	}
+
+	_, err := db.ExecContext(ctx, query,
+		filename,
+		filetype,
+		event,
+		time.Now().UTC(),
+		sql.NullString{String: sourceURL, Valid: sourceURL != ""},
+		sql.NullString{String: outputPath, Valid: outputPath != ""},
+		sql.NullString{String: message, Valid: message != ""},
+		sql.NullString{String: sha256, Valid: sha256 != ""},
+		durationMs,
+	)
+	if err != nil {
+		// Add filetype context to error message
+		return fmt.Errorf("failed to log event '%s' for '%s' (type: %s): %w", event, filename, filetype, err)
+	}
+	return nil
+}
+
+// GetLatestFileEvent retrieves the most recent event record for a specific file identifier and type.
+func GetLatestFileEvent(ctx context.Context, db *sql.DB, filename, filetype string) (event string, timestamp time.Time, message string, found bool, err error) {
+	query := `
+        SELECT event, event_timestamp, message
+        FROM nem_event_log
+        WHERE filename = ? AND filetype = ?
+        ORDER BY event_timestamp DESC, log_id DESC
+        LIMIT 1;
+    `
+	var msg sql.NullString
+	row := db.QueryRowContext(ctx, query, filename, filetype)
+	err = row.Scan(&event, &timestamp, &msg)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", time.Time{}, "", false, nil // Not found, no error
+		}
+		return "", time.Time{}, "", false, fmt.Errorf("failed query latest event for '%s' (%s): %w", filename, filetype, err)
+	}
+	return event, timestamp, msg.String, true, nil
+}
+
+// HasEventOccurred checks if a specific event has ever happened for a file identifier and type.
+func HasEventOccurred(ctx context.Context, db *sql.DB, filename, filetype, event string) (bool, error) {
+	query := `SELECT 1 FROM nem_event_log WHERE filename = ? AND filetype = ? AND event = ? LIMIT 1;`
+	var exists int
+	row := db.QueryRowContext(ctx, query, filename, filetype, event)
+	err := row.Scan(&exists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil // Event has not occurred
+		}
+		return false, fmt.Errorf("failed check event '%s' for '%s' (%s): %w", event, filename, filetype, err)
+	}
+	return true, nil // Event has occurred
+}
+
+// GetCompletionStatusBatch checks a list of file identifiers for a specific completion event and file type
+// using a temporary table approach compatible with DuckDB.
+// Returns a map where the key is the filename identifier and the value is true if the completion event exists.
+func GetCompletionStatusBatch(ctx context.Context, db *sql.DB, filenames []string, filetype string, completionEvent string) (map[string]bool, error) {
+	completedFiles := make(map[string]bool)
+	if len(filenames) == 0 {
+		return completedFiles, nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed begin transaction for batch check: %w", err)
+	}
+	defer tx.Rollback()
+
+	tempTableName := fmt.Sprintf("temp_files_to_check_%d", time.Now().UnixNano())
+	createTempTableSQL := fmt.Sprintf(`CREATE TEMP TABLE %s (filename TEXT PRIMARY KEY);`, tempTableName)
+	_, err = tx.ExecContext(ctx, createTempTableSQL)
+	if err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return nil, fmt.Errorf("failed create temp table %s: %w", tempTableName, err)
+		}
+	}
+
+	insertSQL := fmt.Sprintf(`INSERT INTO %s (filename) VALUES (?)`, tempTableName)
+	stmt, err := tx.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		return nil, fmt.Errorf("failed prepare insert for temp table %s: %w", tempTableName, err)
+	}
+
+	for _, fn := range filenames {
+		select {
+		case <-ctx.Done():
+			stmt.Close()
+			return nil, ctx.Err()
+		default:
+			if _, err := stmt.ExecContext(ctx, fn); err != nil {
+				stmt.Close()
+				return nil, fmt.Errorf("failed insert filename '%s' into temp table %s: %w", fn, tempTableName, err)
+			}
+		}
+	}
+	if err = stmt.Close(); err != nil {
+		return nil, fmt.Errorf("failed close insert statement for %s: %w", tempTableName, err)
+	}
+
+	query := fmt.Sprintf(`
+        SELECT DISTINCT el.filename
+        FROM nem_event_log el
+        JOIN %s tfc ON el.filename = tfc.filename
+        WHERE el.filetype = ? AND el.event = ?;
+    `, tempTableName)
+	rows, err := tx.QueryContext(ctx, query, filetype, completionEvent)
+	if err != nil {
+		return nil, fmt.Errorf("failed batch query joining temp table %s (event=%s, type=%s): %w", tempTableName, completionEvent, filetype, err)
+	}
+
+	for rows.Next() {
+		var filename string
+		if err := rows.Scan(&filename); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("failed scanning batch status row: %w", err)
+		}
+		completedFiles[filename] = true
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("error iterating batch status results: %w", err)
+	}
+	rows.Close()
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed commit transaction for batch check: %w", err)
+	}
+
+	return completedFiles, nil
+}
+
+// GetIdentifierForOutputPath finds the original identifier (URL or inner zip name) and its filetype
+// associated with a saved zip file path by looking for the latest download_end event matching the path.
+func GetIdentifierForOutputPath(ctx context.Context, db *sql.DB, outputPath string) (identifier string, filetype string, found bool, err error) {
+	// We need both filename (identifier) and filetype associated with the output_path
+	query := `
+		SELECT filename, filetype
+		FROM nem_event_log
+		WHERE output_path = ? AND event = ?
+		ORDER BY event_timestamp DESC, log_id DESC
+		LIMIT 1;
+	`
+	// Event download_end should have been logged with the output_path for both outer archives (if saved)
+	// and inner/regular zips.
+	row := db.QueryRowContext(ctx, query, outputPath, EventDownloadEnd)
+	err = row.Scan(&identifier, &filetype)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, nil // Not found
+		}
+		return "", "", false, fmt.Errorf("failed query identifier for path '%s': %w", outputPath, err)
+	}
+	return identifier, filetype, true, nil
+}
+
+// GetPathsToProcess identifies local zip file paths (filetype='zip') that have been downloaded
+// but not yet successfully processed.
+func GetPathsToProcess(ctx context.Context, db *sql.DB) ([]string, error) {
+	paths := []string{}
+
+	// 1. Get all distinct, non-null output paths associated with a 'zip' type download_end event
+	queryPaths := `
+		SELECT DISTINCT output_path
+		FROM nem_event_log
+		WHERE filetype = ? AND event = ? AND output_path IS NOT NULL AND output_path != '';
+	`
+	rowsPaths, err := db.QueryContext(ctx, queryPaths, FileTypeZip, EventDownloadEnd) // Only look for 'zip' type downloads
+	if err != nil {
+		return nil, fmt.Errorf("failed query downloaded zip paths: %w", err)
+	}
+	defer rowsPaths.Close()
+
+	potentialPaths := []string{}
+	for rowsPaths.Next() {
+		var path sql.NullString
+		if err := rowsPaths.Scan(&path); err != nil {
+			return nil, fmt.Errorf("failed scanning downloaded zip path: %w", err)
+		}
+		if path.Valid && path.String != "" {
+			potentialPaths = append(potentialPaths, path.String)
+		}
+	}
+	if err = rowsPaths.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating downloaded zip paths: %w", err)
+	}
+	rowsPaths.Close() // Close early
+
+	if len(potentialPaths) == 0 {
+		return paths, nil
+	} // No downloaded zip paths found
+
+	// 2. For each potential path, find its identifier and check if it has been processed
+	var checkErrors error
+	// Create map of processed identifiers (URLs or inner zip names) for efficiency
+	processedIdentifiers := make(map[string]bool)
+	queryProcessed := `SELECT DISTINCT filename FROM nem_event_log WHERE filetype = ? AND event = ?;`
+	rowsProcessed, err := db.QueryContext(ctx, queryProcessed, FileTypeZip, EventProcessEnd) // Check for 'zip' process end
+	if err != nil {
+		return nil, fmt.Errorf("failed query processed zip identifiers: %w", err)
+	}
+	for rowsProcessed.Next() {
+		var id string
+		if err := rowsProcessed.Scan(&id); err != nil {
+			rowsProcessed.Close()
+			return nil, fmt.Errorf("failed scanning processed zip identifier: %w", err)
+		}
+		processedIdentifiers[id] = true
+	}
+	rowsProcessed.Close()
+	if err = rowsProcessed.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating processed zip identifiers: %w", err)
+	}
+
+	// Now check each path
+	for _, p := range potentialPaths {
+		identifier, fType, found, err := GetIdentifierForOutputPath(ctx, db, p)
+		if err != nil {
+			slog.Warn("Error finding identifier for path, skipping.", "path", p, "error", err)
+			checkErrors = errors.Join(checkErrors, err)
+			continue
+		}
+		if !found {
+			slog.Warn("Could not find identifier for path in DB, skipping.", "path", p)
+			continue
+		}
+		// Ensure we only process things logged as 'zip' type downloads
+		if fType != FileTypeZip {
+			slog.Debug("Identifier found for path, but filetype is not 'zip', skipping processing.", "path", p, "identifier", identifier, "filetype", fType)
+			continue
+		}
+
+		if _, isProcessed := processedIdentifiers[identifier]; !isProcessed {
+			// Check if file actually exists before adding
+			if _, statErr := os.Stat(p); statErr == nil {
+				paths = append(paths, p)
+			} else {
+				slog.Warn("Downloaded path needs processing but file missing.", "path", p, "identifier", identifier, "error", statErr)
+			}
+		}
+	}
+
+	// Return paths and any non-fatal errors encountered during checks
+	return paths, checkErrors
+}
+
+// DisplayFileHistory queries and prints the event log for files.
+func DisplayFileHistory(ctx context.Context, db *sql.DB, filetypeFilter, eventFilter string, limit int) error {
+	query := `
+        SELECT filename, filetype, event, event_timestamp, message, duration_ms, source_url, output_path
+        FROM nem_event_log
+    `
+	conditions := []string{}
+	args := []any{}
+	argCounter := 1 // Start with $1 for positional args
+
+	if filetypeFilter != "" {
+		conditions = append(conditions, fmt.Sprintf("filetype = $%d", argCounter))
+		args = append(args, filetypeFilter)
+		argCounter++
+	}
+	if eventFilter != "" {
+		conditions = append(conditions, fmt.Sprintf("event = $%d", argCounter))
+		args = append(args, eventFilter)
+		argCounter++
+	}
+
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	query += fmt.Sprintf(" ORDER BY event_timestamp DESC, log_id DESC LIMIT $%d", argCounter)
+	args = append(args, limit)
+
+	fmt.Printf("--- Event Log History (Limit %d) ---\n", limit)
+	fmt.Printf("%-50s | %-15s | %-15s | %-25s | %-10s | %s\n", "Identifier", "Type", "Event", "Timestamp (UTC)", "DurationMS", "Message/Details") // Adjusted header
+	fmt.Println(strings.Repeat("-", 150))
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to query event log: %w \n Query: %s \n Args: %v", err, query, args)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var filename, filetype, event string
+		var timestamp time.Time
+		var message, sourceURL, outputPath sql.NullString
+		var durationMs sql.NullInt64
+		if err := rows.Scan(&filename, &filetype, &event, &timestamp, &message, &durationMs, &sourceURL, &outputPath); err != nil {
+			return fmt.Errorf("failed to scan event log row: %w", err)
+		}
+
+		durationStr := ""
+		if durationMs.Valid {
+			durationStr = fmt.Sprintf("%d", durationMs.Int64)
+		}
+
+		details := message.String
+		if sourceURL.Valid && sourceURL.String != "" {
+			details += fmt.Sprintf(" (Source: %s)", filepath.Base(sourceURL.String))
+		}
+		if outputPath.Valid && outputPath.String != "" {
+			details += fmt.Sprintf(" (Output: %s)", filepath.Base(outputPath.String))
+		}
+
+		// Truncate filename if too long for display
+		displayFilename := filename
+		if len(displayFilename) > 50 {
+			displayFilename = "..." + displayFilename[len(displayFilename)-47:]
+		}
+
+		fmt.Printf("%-50s | %-15s | %-15s | %-25s | %-10s | %s\n",
+			displayFilename, filetype, event, timestamp.Format(time.RFC3339), durationStr, details)
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("error iterating event log rows: %w", err)
+	}
+	fmt.Printf("Displayed %d records.\n", count)
+	return nil
+}
+
+
+##################################################
+# File: ./internal/inspector/inspector.go
+##################################################
+package inspector
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"regexp" // Import regexp for filename parsing
+	"sort"
+	"strings"
+	"time"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/config"
+
+	_ "github.com/marcboeker/go-duckdb"
+)
+
+// Define a structure to hold summary info for each file type
+type fileTypeSummary struct {
+	fileType        string // e.g., "EST_PERF_COST_RATE_v1"
+	fileCount       int    // How many files of this type
+	totalRowCount   int64
+	minTimestamp    sql.NullInt64 // Store as epoch ms (BIGINT)
+	maxTimestamp    sql.NullInt64 // Store as epoch ms (BIGINT)
+	schema          string        // Representative schema string
+	columnNames     []string      // List of column names from schema
+	schemaErr       error         // Error getting schema
+	statsErr        error         // Error getting stats
+	hasTimestampCol bool          // Flag indicating if INTERVAL_DATETIME exists
+	firstFilePath   string        // Path to one file of this type (for getting schema)
+}
+
+// Regex pattern for the expected NEM filename format
+// Captures the type identifier after the timestamp and long number.
+// Allows for flexibility in the prefix before the date.
+// Ensures _v followed by digits at the end of the captured group.
+var (
+	nemPatternRegex = regexp.MustCompile(`^.*_\d+_(.+_v\d+)\.parquet$`)
+	// If the timestamp/ID lengths vary slightly, adjust digits: e.g., \d{8,12}_\d{10,18}
+)
+
+// ExtractFileType extracts the type identifier part (e.g., "FORECAST_DEFAULT_CF_v1")
+// from a Parquet filename conforming to the expected NEM pattern.
+// Returns an error if the filename does not match the pattern.
+func extractFileType(filename string) (string, error) {
+	matches := nemPatternRegex.FindStringSubmatch(filename)
+	if len(matches) > 1 {
+		// Check if the captured group itself looks like a valid type_vX
+		// (This adds robustness if the regex accidentally captures too much)
+		// For now, assume the regex capture is correct if it matches.
+		return matches[1], nil // Return the captured group
+	}
+
+	// Filename did not match the expected NEM pattern
+	return "", fmt.Errorf("filename '%s' does not match expected NEM pattern (..._YYYYMMDDHHMM_LONGNUMBER_TYPE_vX.parquet)", filename)
+}
+
+// InspectParquet summarizes Parquet files by type.
+func InspectParquet(cfg config.Config, logger *slog.Logger) error {
+	logger.Info("--- Starting Parquet File Summary Inspection ---")
+
+	db, err := sql.Open("duckdb", cfg.DbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open duckdb (%s): %w", cfg.DbPath, err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get connection: %w", err)
+	}
+	defer conn.Close()
+
+	logger.Debug("Installing and loading Parquet extension.")
+	setupSQL := `INSTALL parquet; LOAD parquet;`
+	if _, err := conn.ExecContext(ctx, setupSQL); err != nil {
+		logger.Warn("Failed install/load parquet extension.", "error", err)
+	} else {
+		logger.Debug("Parquet extension loaded.")
+	}
+
+	// 1. Glob all files
+	globPattern := filepath.Join(cfg.OutputDir, "*.parquet")
+	parquetFiles, err := filepath.Glob(globPattern)
+	if err != nil {
+		return fmt.Errorf("failed glob parquet files in %s: %w", cfg.OutputDir, err)
+	}
+	if len(parquetFiles) == 0 {
+		logger.Info("No *.parquet files found.", "dir", cfg.OutputDir)
+		return nil
+	}
+	logger.Info("Found parquet files to summarize.", slog.Int("count", len(parquetFiles)), slog.String("dir", cfg.OutputDir))
+
+	// 2. Categorize files by type, handling extraction errors
+	filesByType := make(map[string][]string)
+	var categorizationErrors error
+	for _, fp := range parquetFiles {
+		baseFilename := filepath.Base(fp)
+		fileType, err := extractFileType(baseFilename) // Use updated function
+		if err != nil {
+			logger.Warn("Skipping file due to unexpected name format.", slog.String("file", baseFilename), slog.String("error", err.Error()))
+			categorizationErrors = errors.Join(categorizationErrors, err) // Collect errors
+			continue                                                      // Skip this file
+		}
+		filesByType[fileType] = append(filesByType[fileType], fp)
+	}
+	// Log if any files were skipped during categorization
+	if categorizationErrors != nil {
+		logger.Warn("Some files were skipped during categorization due to unexpected filenames.", "error", categorizationErrors)
+	}
+	if len(filesByType) == 0 {
+		logger.Info("No files matched the expected naming pattern for categorization.")
+		return categorizationErrors // Return errors if any occurred
+	}
+
+	// 3. Process each type
+	summaries := make(map[string]*fileTypeSummary)
+	var orderedTypes []string
+	for fileType, files := range filesByType {
+		if len(files) == 0 {
+			continue
+		} // Should not happen after filtering
+		orderedTypes = append(orderedTypes, fileType)
+		l := logger.With(slog.String("file_type", fileType))
+		l.Info("Processing file type", slog.Int("file_count", len(files)))
+
+		summary := &fileTypeSummary{fileType: fileType, fileCount: len(files), firstFilePath: files[0]}
+		summaries[fileType] = summary
+
+		// --- Get Schema and Column Names from first file ---
+		l.Debug("Getting representative schema.", slog.String("from_file", summary.firstFilePath))
+		schemaStr, columnNames, schemaErr := getSchemaAndColumns(ctx, conn, summary.firstFilePath)
+		summary.schema = schemaStr
+		summary.columnNames = columnNames
+		summary.schemaErr = schemaErr
+		if schemaErr != nil {
+			l.Error("Failed getting schema for type", "error", schemaErr)
+		}
+
+		// --- Check if the relevant timestamp column exists ---
+		timestampColumnName := "INTERVAL_DATETIME"
+		summary.hasTimestampCol = false
+		if summary.schemaErr == nil {
+			for _, colName := range summary.columnNames {
+				if strings.EqualFold(colName, timestampColumnName) {
+					summary.hasTimestampCol = true
+					break
+				}
+			}
+		}
+		l.Debug("Timestamp column check", slog.Bool("found_"+timestampColumnName, summary.hasTimestampCol))
+
+		// --- Get Aggregated Stats ---
+		l.Debug("Getting aggregated statistics.")
+		var escapedFilePaths []string
+		for _, p := range files {
+			dp := strings.ReplaceAll(p, `\`, `/`)
+			ep := strings.ReplaceAll(dp, "'", "''")
+			escapedFilePaths = append(escapedFilePaths, fmt.Sprintf("'%s'", ep))
+		}
+		fileListLiteral := fmt.Sprintf("[%s]", strings.Join(escapedFilePaths, ", "))
+
+		var statsSQL string
+		if summary.hasTimestampCol {
+			statsSQL = fmt.Sprintf(`SELECT COUNT(*) as total_rows, MIN(%s) as min_ts, MAX(%s) as max_ts FROM read_parquet(%s);`, timestampColumnName, timestampColumnName, fileListLiteral)
+		} else {
+			statsSQL = fmt.Sprintf(`SELECT COUNT(*) as total_rows, NULL::BIGINT as min_ts, NULL::BIGINT as max_ts FROM read_parquet(%s);`, fileListLiteral)
+		}
+
+		l.Debug("Executing stats query", slog.String("sql", statsSQL))
+		var totalRows sql.NullInt64
+		var minTs, maxTs sql.NullInt64
+		err = conn.QueryRowContext(ctx, statsSQL).Scan(&totalRows, &minTs, &maxTs)
+		if err != nil {
+			summary.statsErr = err
+			l.Error("Failed getting statistics for type", "error", err)
+		} else {
+			summary.totalRowCount = totalRows.Int64
+			summary.minTimestamp = minTs
+			summary.maxTimestamp = maxTs
+			l.Info("Statistics gathered.", slog.Int64("total_rows", summary.totalRowCount), slog.Int64("min_epoch_ms", summary.minTimestamp.Int64), slog.Int64("max_epoch_ms", summary.maxTimestamp.Int64), slog.Bool("min_valid", summary.minTimestamp.Valid), slog.Bool("max_valid", summary.maxTimestamp.Valid))
+		}
+	} // End loop file types
+
+	// 4. Format and Print Output (Unchanged)
+	logger.Info("--- Parquet File Summary ---")
+	fmt.Println("\n--- Parquet File Summary ---")
+	sort.Strings(orderedTypes)
+	for _, fileType := range orderedTypes {
+		summary := summaries[fileType]
+		fmt.Printf("\n=== File Type: %s ===\n", summary.fileType)
+		fmt.Printf("    (Found %d files)\n", summary.fileCount)
+		fmt.Println("\n  Representative Schema:")
+		if summary.schemaErr != nil {
+			fmt.Printf("    ERROR retrieving schema: %v\n", summary.schemaErr)
+		} else if summary.schema == "" {
+			fmt.Println("    (Schema not found or file empty)")
+		} else {
+			schemaLines := strings.Split(summary.schema, "\n")
+			for _, line := range schemaLines {
+				fmt.Printf("    %s\n", line)
+			}
+		}
+	}
+	fmt.Println("\n--- Aggregated Statistics ---")
+	fmt.Printf("%-40s | %-10s | %-15s | %-25s | %-25s | %s\n", "File Type", "File Count", "Total Rows", "Min Timestamp (UTC)", "Max Timestamp (UTC)", "Errors")
+	fmt.Println(strings.Repeat("-", 130))
+	for _, fileType := range orderedTypes {
+		summary := summaries[fileType]
+		var minTsStr, maxTsStr string = "N/A", "N/A"
+		if summary.minTimestamp.Valid {
+			minTsUTC := time.UnixMilli(summary.minTimestamp.Int64).UTC()
+			minTsStr = minTsUTC.Format(time.RFC3339)
+		}
+		if summary.maxTimestamp.Valid {
+			maxTsUTC := time.UnixMilli(summary.maxTimestamp.Int64).UTC()
+			maxTsStr = maxTsUTC.Format(time.RFC3339)
+		}
+		errorStr := ""
+		if summary.schemaErr != nil && summary.statsErr != nil {
+			errorStr = "Schema & Stats Error"
+		} else if summary.schemaErr != nil {
+			errorStr = "Schema Error"
+		} else if summary.statsErr != nil {
+			errorStr = "Stats Error"
+		}
+		fmt.Printf("%-40s | %-10d | %-15d | %-25s | %-25s | %s\n", summary.fileType, summary.fileCount, summary.totalRowCount, minTsStr, maxTsStr, errorStr)
+	}
+	fmt.Println(strings.Repeat("-", 130))
+	logger.Info("--- Parquet File Summary Inspection Finished ---")
+	// Combine categorization errors with other errors
+	var finalErr error = categorizationErrors
+	for _, summary := range summaries {
+		finalErr = errors.Join(finalErr, summary.schemaErr, summary.statsErr)
+	}
+	if finalErr != nil {
+		logger.Warn("Inspection completed with errors.", "error", finalErr)
+	}
+	return finalErr
+}
+
+// getSchemaAndColumns (Unchanged)
+func getSchemaAndColumns(ctx context.Context, conn *sql.Conn, filePath string) (schemaString string, columnNames []string, err error) {
+	// ... (Implementation unchanged) ...
+	duckdbFilePath := strings.ReplaceAll(filePath, `\`, `/`)
+	escapedFilePath := strings.ReplaceAll(duckdbFilePath, "'", "''")
+	describeSQL := fmt.Sprintf("DESCRIBE SELECT * FROM read_parquet('%s');", escapedFilePath)
+	schemaRows, err := conn.QueryContext(ctx, describeSQL)
+	if err != nil {
+		if strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "No files found") {
+			return "(File not found or empty)", nil, nil
+		}
+		return "", nil, fmt.Errorf("query schema for %s: %w", filePath, err)
+	}
+	defer schemaRows.Close()
+	var schemaBuilder strings.Builder
+	columnNames = []string{}
+	schemaBuilder.WriteString(fmt.Sprintf("  %-30s | %-20s | %-5s | %-5s | %-5s | %s\n", "Column Name", "Column Type", "Null", "Key", "Default", "Extra"))
+	schemaBuilder.WriteString("  " + strings.Repeat("-", 90) + "\n")
+	columnCount := 0
+	for schemaRows.Next() {
+		var colName, colType, nullVal, keyVal, defaultVal, extraVal sql.NullString
+		if scanErr := schemaRows.Scan(&colName, &colType, &nullVal, &keyVal, &defaultVal, &extraVal); scanErr != nil {
+			return "", nil, fmt.Errorf("scan schema row for %s: %w", filePath, scanErr)
+		}
+		schemaBuilder.WriteString(fmt.Sprintf("  %-30s | %-20s | %-5s | %-5s | %-5s | %s\n", colName.String, colType.String, nullVal.String, keyVal.String, defaultVal.String, extraVal.String))
+		if colName.Valid {
+			columnNames = append(columnNames, colName.String)
+		}
+		columnCount++
+	}
+	if err = schemaRows.Err(); err != nil {
+		return "", nil, fmt.Errorf("iterate schema rows for %s: %w", filePath, err)
+	}
+	if columnCount == 0 {
+		return "(No columns found)", nil, nil
+	}
+	return strings.TrimRight(schemaBuilder.String(), "\n"), columnNames, nil
+}
+
+
+##################################################
+# File: ./internal/downloader/downloader.go
+##################################################
+package downloader
+
+import (
+	"bytes" // Needed for html.Parse
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand" // Import math/rand
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath" // Needed for Abs and Base
+	"strings"
+	"sync"
+
+	// "sync/atomic" // No longer needed
+	"time"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/config"
+	"github.com/brensch/nemparquet/internal/db"
+	"github.com/brensch/nemparquet/internal/util"
+
+	"golang.org/x/net/html"
+	// Removed semaphore, atomic
+)
+
+// --- List of Realistic User Agents ---
+var commonUserAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5.1 Safari/605.1.15",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+}
+
+// Seed random number generator once
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+// Function to get a random user agent
+func GetRandomUserAgent() string { // Exported function
+	if len(commonUserAgents) == 0 {
+		// Fallback if list is somehow empty
+		return "NEMParquetConverter/1.2 (Go-client)" // Increment version maybe
+	}
+	return commonUserAgents[rand.Intn(len(commonUserAgents))]
+}
+
+// DiscoverZipURLs performs the discovery phase for a given list of feed URLs.
+// Returns a map of discovered ZipURL -> SourceFeedURL and any non-fatal discovery error.
+func DiscoverZipURLs(ctx context.Context, repos []string, logger *slog.Logger) (map[string]string, error) {
+	client := util.DefaultHTTPClient()
+	var discoveryErr error
+	// Combine both feed URL lists for discovery
+	discoveredLinks := make(map[string]string) // Map absolute URL -> source feed URL
+	processedFeeds := 0
+	var discoveryMu sync.Mutex // Protect map access
+
+	logger.Debug("Starting discovery across feed URLs", slog.Int("feed_count", len(repos)))
+	for _, baseURL := range repos {
+		// Check for context cancellation before processing each feed
+		select {
+		case <-ctx.Done():
+			logger.Warn("Discovery cancelled by context.")
+			return nil, errors.Join(discoveryErr, ctx.Err())
+		default:
+			// Continue processing feed
+		}
+
+		processedFeeds++
+		l := logger.With(slog.String("feed_url", baseURL), slog.Int("feed_num", processedFeeds), slog.Int("total_feeds", len(repos)))
+		l.Debug("Checking feed for discovery")
+
+		base, err := url.Parse(baseURL)
+		if err != nil {
+			l.Warn("Skip: parse base URL failed.", "error", err)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("parse base %s: %w", baseURL, err))
+			continue
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil)
+		if err != nil {
+			l.Warn("Skip: create request failed.", "error", err)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("create request %s: %w", baseURL, err))
+			continue
+		}
+		// Set a user agent for discovery requests too
+		req.Header.Set("User-Agent", GetRandomUserAgent()) // Use exported function
+
+		resp, err := client.Do(req)
+		if err != nil {
+			l.Warn("Skip: GET failed.", "error", err)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("discover GET %s: %w", baseURL, err))
+			continue
+		}
+		// Ensure body is read and closed even on non-200 status codes to free resources
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close() // Close body immediately
+
+		if resp.StatusCode != http.StatusOK {
+			l.Warn("Skip: Bad status.", "status", resp.Status)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("discover status %s: %s", resp.Status, baseURL))
+			continue // Continue even if body read failed on non-200
+		}
+		if readErr != nil {
+			l.Warn("Skip: read body failed.", "error", readErr)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("discover read %s: %w", baseURL, readErr))
+			continue
+		}
+
+		root, err := html.Parse(bytes.NewReader(bodyBytes))
+		if err != nil {
+			l.Warn("Skip: parse HTML failed.", "error", err)
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("discover parse HTML %s: %w", baseURL, err))
+			continue
+		}
+
+		links := util.ParseLinks(root, ".zip")
+		discoveryMu.Lock() // Lock map access
+		newLinksFound := 0
+		for _, relativeLink := range links {
+			zipURLAbs, err := base.Parse(relativeLink)
+			if err == nil {
+				absURL := zipURLAbs.String()
+				if _, exists := discoveredLinks[absURL]; !exists {
+					discoveredLinks[absURL] = baseURL // Store source feed
+					newLinksFound++
+				}
+			} else {
+				l.Warn("Failed to resolve relative link", "link", relativeLink, "error", err)
+			}
+		}
+		discoveryMu.Unlock() // Unlock map access
+		l.Debug("Feed check complete", slog.Int("new_links", newLinksFound), slog.Int("total_unique_links", len(discoveredLinks)))
+	} // End feed discovery loop
+
+	logger.Debug("Finished discovery phase.", slog.Int("total_unique_zips", len(discoveredLinks)))
+	return discoveredLinks, discoveryErr
+}
+
+// RunSequentialDownloads iterates through URLs, downloads them sequentially,
+// and sends the *local path* of successfully downloaded files to the output channel.
+// This is called by the orchestrator.
+func RunSequentialDownloads(
+	ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger,
+	urlsToDownload []string, downloadedPathsChan chan<- string, // Takes list of URLs to download
+	urlToSourceMap map[string]string, // Need source URL for logging
+) error {
+	client := util.DefaultHTTPClient()
+	var finalErr error
+	processedCount := 0
+
+	logger.Info("Sequential downloader started.", slog.Int("count", len(urlsToDownload)))
+
+	for _, zipURL := range urlsToDownload {
+		select {
+		case <-ctx.Done():
+			logger.Warn("Download sequence cancelled.")
+			finalErr = errors.Join(finalErr, ctx.Err())
+			return finalErr // Exit loop early
+		default:
+			// Continue with download
+		}
+
+		processedCount++
+		l := logger.With(
+			slog.String("zip_url", zipURL),
+			slog.Int("zip_num", processedCount),
+			slog.Int("total_to_process", len(urlsToDownload)),
+		)
+		l.Info("Processing download.")
+
+		sourceURL := urlToSourceMap[zipURL] // Get source URL from map passed by orchestrator
+
+		// Call DownloadSingleZipAndSave (renamed from downloadSingleZipAndSave)
+		savedPath, err := DownloadSingleZipAndSave(ctx, cfg, dbConn, l, client, zipURL, sourceURL)
+
+		if err != nil {
+			l.Error("Failed to download zip", "error", err) // Error logged within DownloadSingleZipAndSave too
+			finalErr = errors.Join(finalErr, fmt.Errorf("download %s: %w", zipURL, err))
+			// Continue to the next file even if one fails
+		} else if savedPath != "" {
+			l.Info("Successfully downloaded zip.", slog.String("saved_path", savedPath))
+			// Send the *path* of the successfully downloaded file to the processor channel
+			select {
+			case downloadedPathsChan <- savedPath:
+				l.Debug("Sent path to processor channel.", slog.String("path", savedPath))
+			case <-ctx.Done():
+				logger.Warn("Download sequence cancelled while sending path to processor.")
+				finalErr = errors.Join(finalErr, ctx.Err())
+				// Need to ensure channel is closed eventually if we exit here
+				// The defer close in the calling goroutine (orchestrator) handles this.
+				return finalErr // Exit loop if cancelled while sending
+			}
+		}
+		// Optional small delay between downloads
+		// time.Sleep(50 * time.Millisecond)
+	}
+
+	logger.Info("Sequential downloader finished processing all URLs.")
+	return finalErr
+}
+
+// DownloadSingleZipAndSave handles downloading one zip and saving it.
+// Returns the saved absolute path on success, or error on failure.
+// Logs events using the original zipURL as the filename key.
+func DownloadSingleZipAndSave(ctx context.Context, cfg config.Config, dbConn *sql.DB, logger *slog.Logger, client *http.Client, zipURL, sourceFeedURL string) (string, error) {
+	startTime := time.Now()
+	zipFilename := filepath.Base(zipURL)
+	relativeOutputPath := filepath.Join(cfg.InputDir, zipFilename) // Relative path first
+
+	// Calculate Absolute Path
+	outputZipPath, absErr := filepath.Abs(relativeOutputPath)
+	if absErr != nil {
+		pathErr := fmt.Errorf("failed to get absolute path for %s: %w", relativeOutputPath, absErr)
+		logger.Error("Cannot determine absolute output path.", "relative_path", relativeOutputPath, "error", pathErr)
+		// Log an event without a valid path? Maybe log with relative path?
+		db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventError, sourceFeedURL, relativeOutputPath, pathErr.Error(), "", nil)
+		return "", pathErr
+	}
+	l := logger.With(slog.String("output_path", outputZipPath)) // Add abs path to logger context
+
+	l.Info("Starting download.")
+	// Log start event with the absolute path in output_path, URL as filename
+	db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventDownloadStart, sourceFeedURL, outputZipPath, "", "", nil)
+
+	// Create request object
+	req, err := http.NewRequestWithContext(ctx, "GET", zipURL, nil)
+	if err != nil {
+		reqErr := fmt.Errorf("create request failed: %w", err)
+		// Log event with absolute path
+		db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventError, sourceFeedURL, outputZipPath, reqErr.Error(), "", nil)
+		logger.Error("Failed creating request.", "error", reqErr)
+		return "", reqErr
+	}
+	req.Header.Set("User-Agent", GetRandomUserAgent()) // Use exported function
+	req.Header.Set("Accept", "application/zip,application/octet-stream,*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	progressCallback := func(downloadedBytes int64, totalBytes int64) {
+		// Log progress every 100MB (logic is inside the progressReader now)
+		// Ensure logger passed here has the right context (it does via 'l')
+		if totalBytes > 0 {
+			l.Info("Download progress", slog.Int64("downloaded_mb", downloadedBytes/(1024*1024)), slog.Int64("total_mb", totalBytes/(1024*1024)), slog.Float64("percent", float64(downloadedBytes)*100.0/float64(totalBytes)))
+		} else {
+			l.Info("Download progress", slog.Int64("downloaded_mb", downloadedBytes/(1024*1024)))
+		}
+	}
+	// Download File content
+	data, err := util.DownloadFileWithProgress(client, req, progressCallback)
+	downloadDuration := time.Since(startTime)
+
+	// --- Error Handling ---
+	if err != nil {
+		dlErr := fmt.Errorf("download http failed: %w", err)
+		isRateLimitError := false
+		errString := strings.ToLower(dlErr.Error())
+		if strings.Contains(errString, "429") || strings.Contains(errString, "503") || strings.Contains(errString, "403") || strings.Contains(errString, "forbidden") || strings.Contains(errString, "too many") {
+			isRateLimitError = true
+		}
+		// Log event with absolute path
+		db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventError, sourceFeedURL, outputZipPath, dlErr.Error(), "", &downloadDuration)
+		if isRateLimitError {
+			logger.Warn("Download failed (Rate limit/block suspected).", "error", dlErr, slog.Duration("duration", downloadDuration.Round(time.Millisecond)))
+		} else {
+			logger.Error("Download failed.", "error", dlErr, slog.Duration("duration", downloadDuration.Round(time.Millisecond)))
+		}
+		return "", dlErr // Return the error
+	}
+	// --- End Error Handling ---
+
+	// --- Success Path ---
+	l.Debug("Download complete.", slog.Int("bytes", len(data)), slog.Duration("duration", downloadDuration.Round(time.Millisecond)))
+
+	// Save the downloaded data to disk (using absolute path)
+	err = os.WriteFile(outputZipPath, data, 0644)
+	saveDuration := time.Since(startTime) // Update duration to include save time
+	if err != nil {
+		saveErr := fmt.Errorf("failed to save zip file %s: %w", outputZipPath, err)
+		// Log event with absolute path
+		db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventError, sourceFeedURL, outputZipPath, saveErr.Error(), "", &saveDuration)
+		logger.Error("Failed saving downloaded zip.", "error", err, slog.Duration("total_duration", saveDuration.Round(time.Millisecond)))
+		return "", saveErr
+	}
+	l.Debug("Saved zip file successfully.", slog.Duration("total_duration", saveDuration.Round(time.Millisecond)))
+
+	// Log download end event with the absolute path
+	db.LogFileEvent(ctx, dbConn, zipURL, db.FileTypeZip, db.EventDownloadEnd, sourceFeedURL, outputZipPath, "", "", &saveDuration)
+
+	return outputZipPath, nil // Return absolute path on success
+}
+
+
+##################################################
+# File: ./cmd/run.go
+##################################################
+package cmd
+
+import (
+	"context"
+	"fmt"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/orchestrator" // Use new orchestrator
+
+	"github.com/spf13/cobra"
+)
+
+// Flags for the run command (can override persistent flags if needed)
+var forceDownloadRun bool
+var forceProcessRun bool
+
+// runCmd represents the combined download and process command
+var runCmd = &cobra.Command{
+	Use:   "run",
+	Short: "Run the full download and process workflow",
+	Long: `Performs the complete data pipeline:
+1. Discovers all zip URLs from configured feeds.
+2. Checks the database to identify missing downloads and pending processing jobs.
+3. Sequentially downloads missing zip files to the input directory.
+4. Concurrently processes downloaded zip files (extracting CSVs and converting to Parquet).
+Use --force-download to re-download all discovered files.
+Use --force-process to re-process all downloaded files.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		logger := getLogger()
+		db := getDB()
+		cfg := getConfig()
+
+		// Get flag values specifically for this command run
+		forceDownloadFlag, _ := cmd.Flags().GetBool("force-download")
+		forceProcessFlag, _ := cmd.Flags().GetBool("force-process")
+
+		logger.Info("Starting combined run workflow...")
+
+		// Call the orchestrator function
+		err := orchestrator.RunCombinedWorkflow(
+			context.Background(), // Use background context for now
+			cfg,
+			db,
+			logger,
+			forceDownloadFlag,
+			forceProcessFlag,
+		)
+
+		if err != nil {
+			logger.Error("Combined workflow completed with errors", "error", err)
+			return fmt.Errorf("run workflow failed: %w", err)
+		}
+
+		logger.Info("Combined workflow completed successfully.")
+		return nil
+	},
+}
+
+func init() {
+	// Add flags specific to the 'run' command
+	runCmd.Flags().BoolVar(&forceDownloadRun, "force-download", false, "Force download of all discovered archives, ignoring DB state.")
+	runCmd.Flags().BoolVar(&forceProcessRun, "force-process", false, "Force processing of downloaded zips, ignoring DB state.")
+
+	// Add the run command to the root command
+	// Ensure downloadCmd and processCmd are removed from root in root.go's init
+	// rootCmd.AddCommand(runCmd) // This should be done in root.go's init typically, or here is fine too
+}
+
+
+##################################################
+# File: ./cmd/state.go
+##################################################
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"strings" // Import strings
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/db"
+
+	"github.com/spf13/cobra"
+)
+
+// Flags remain the same
+var stateLimit int
+var stateFilterStatus string
+
+// stateCmd represents the command to view DB state (updated description)
+var stateCmd = &cobra.Command{
+	Use:   "state [filetype]",
+	Short: "View the event log history for tracked files (zips or csvs)",
+	Long: `Queries the DuckDB event log and displays the history for tracked files.
+Specify 'zips' or 'csvs' as an optional argument to filter by file type.
+Use flags to filter by event type (status) and limit the output.`,
+	Args: cobra.MaximumNArgs(1), // 0 or 1 argument
+	RunE: func(cmd *cobra.Command, args []string) error {
+		logger := getLogger()
+		dbConn := getDB()
+		fileTypeFilter := ""
+		if len(args) > 0 {
+			fileType := strings.ToLower(args[0])
+			if fileType == "zips" || fileType == "zip" {
+				fileTypeFilter = db.FileTypeZip
+			} else if fileType == "csvs" || fileType == "csv" {
+				fileTypeFilter = db.FileTypeCsv
+			} else {
+				return fmt.Errorf("invalid filetype filter: %s (use 'zips' or 'csvs')", args[0])
+			}
+		}
+
+		logger.Info("Querying database event log", "type_filter", fileTypeFilter, "event_filter", stateFilterStatus, "limit", stateLimit)
+
+		// Call the updated display function
+		err := db.DisplayFileHistory(context.Background(), dbConn, fileTypeFilter, stateFilterStatus, stateLimit)
+
+		if err != nil {
+			logger.Error("Failed to display state history", "error", err)
+			return err
+		}
+
+		return nil
+	},
+}
+
+func init() {
+	stateCmd.Flags().IntVarP(&stateLimit, "limit", "n", 50, "Limit the number of log records displayed")
+	// Rename status flag to event flag for clarity
+	stateCmd.Flags().StringVarP(&stateFilterStatus, "event", "e", "", "Filter records by event type (e.g., download_end, error, process_start)")
+}
+
+
+##################################################
+# File: ./cmd/root.go
+##################################################
+package cmd
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/config"
+	"github.com/brensch/nemparquet/internal/db"
+
+	"github.com/lmittmann/tint"         // Import the tint handler
+	_ "github.com/marcboeker/go-duckdb" // DuckDB driver
+	"github.com/spf13/cobra"
+)
+
+var (
+	// Config flags - bound in init()
+	cfgFile         string
+	inputDir        string
+	outputDir       string
+	dbPath          string
+	workers         int
+	logFormat       string
+	logLevel        string
+	logOutput       string
+	feedUrls        []string
+	archiveFeedUrls []string
+
+	// Global instances populated in PersistentPreRunE
+	rootLogger *slog.Logger
+	dbConn     *sql.DB
+	appConfig  config.Config
+)
+
+// rootCmd represents the base command when called without any subcommands
+var rootCmd = &cobra.Command{
+	Use:   "nemparquet",
+	Short: "Download, process NEM data feeds into Parquet, and run analysis.",
+	Long: `NemParquet handles fetching NEM data feeds, converting CSV sections to Parquet,
+and running DuckDB analysis. It uses a DuckDB database to track file event history.
+
+The primary command is 'run', which orchestrates the download and processing workflow.
+Other commands allow inspecting data, running analysis separately, or viewing state.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// --- 1. Initialize Logger ---
+		var level slog.Level
+		switch strings.ToLower(logLevel) {
+		case "debug":
+			level = slog.LevelDebug
+		case "info":
+			level = slog.LevelInfo
+		case "warn":
+			level = slog.LevelWarn
+		case "error":
+			level = slog.LevelError
+		default:
+			level = slog.LevelInfo
+		}
+
+		var logWriter io.Writer = os.Stderr // Default to stderr
+		logFileHandle := io.Closer(nil)     // Keep track of file handle if opened
+		isTerminal := false                 // Flag to check if output is a terminal
+
+		if logOutput != "" && strings.ToLower(logOutput) != "stderr" {
+			if strings.ToLower(logOutput) == "stdout" {
+				logWriter = os.Stdout
+				// Check if stdout is a terminal
+				if fileInfo, _ := os.Stdout.Stat(); (fileInfo.Mode() & os.ModeCharDevice) != 0 {
+					isTerminal = true
+				}
+			} else {
+				// Attempt to open file
+				f, err := os.OpenFile(logOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					return fmt.Errorf("failed to open log file %s: %w", logOutput, err)
+				}
+				logWriter = f
+				logFileHandle = f  // Store handle for potential closing later
+				isTerminal = false // File output is not a terminal
+			}
+		} else {
+			// Defaulting to stderr, check if it's a terminal
+			if fileInfo, _ := os.Stderr.Stat(); (fileInfo.Mode() & os.ModeCharDevice) != 0 {
+				isTerminal = true
+			}
+		}
+
+		var handler slog.Handler
+		logFormatLower := strings.ToLower(logFormat)
+
+		// *** Use tint handler for text format if output is a terminal ***
+		if logFormatLower == "text" {
+			handler = tint.NewHandler(logWriter, &tint.Options{
+				Level:      level,
+				TimeFormat: time.Kitchen, // Example time format
+				AddSource:  false,        // Disable source code location for cleaner logs
+				NoColor:    !isTerminal,  // Disable color if not writing to a terminal
+			})
+		} else if logFormatLower == "json" {
+			handler = slog.NewJSONHandler(logWriter, &slog.HandlerOptions{
+				Level:     level,
+				AddSource: true, // Optionally add source for JSON
+			})
+		} else {
+			// Fallback to default text handler if format is unknown
+			handler = slog.NewTextHandler(logWriter, &slog.HandlerOptions{
+				Level:     level,
+				AddSource: false,
+			})
+		}
+
+		rootLogger = slog.New(handler)
+		slog.SetDefault(rootLogger)
+		rootLogger.Info("Logger initialized", "level", level.String(), "format", logFormat, "output", logOutput, "colors_enabled", isTerminal && logFormatLower == "text")
+
+		// --- 2. Load/Validate Config (from flags) ---
+		appConfig = config.Config{ /* ... */
+			InputDir: inputDir, OutputDir: outputDir, DbPath: dbPath, NumWorkers: workers, FeedURLs: feedUrls, ArchiveFeedURLs: archiveFeedUrls, SchemaRowLimit: config.DefaultSchemaRowLimit,
+		}
+		rootLogger.Debug("Configuration loaded", slog.Any("config", appConfig))
+		if appConfig.InputDir == "" || appConfig.OutputDir == "" || appConfig.DbPath == "" {
+			return fmt.Errorf("--input-dir, --output-dir, and --db-path flags are required")
+		}
+		for _, d := range []string{appConfig.InputDir, appConfig.OutputDir} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				return fmt.Errorf("failed to create directory %s: %w", d, err)
+			}
+		}
+		if appConfig.DbPath != ":memory:" {
+			dbDir := filepath.Dir(appConfig.DbPath)
+			if err := os.MkdirAll(dbDir, 0o755); err != nil {
+				return fmt.Errorf("failed to create database directory %s: %w", dbDir, err)
+			}
+		}
+
+		// --- 3. Initialize DuckDB Connection & Schema ---
+		rootLogger.Info("Initializing DuckDB connection", "path", appConfig.DbPath)
+		var err error
+		dbConn, err = sql.Open("duckdb", appConfig.DbPath)
+		if err != nil {
+			return fmt.Errorf("failed to open duckdb database (%s): %w", appConfig.DbPath, err)
+		}
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err = dbConn.PingContext(pingCtx); err != nil {
+			dbConn.Close()
+			return fmt.Errorf("failed to ping duckdb database (%s): %w", appConfig.DbPath, err)
+		}
+		rootLogger.Info("DuckDB connection successful.")
+		if err := db.InitializeSchema(dbConn); err != nil {
+			dbConn.Close()
+			return fmt.Errorf("failed to initialize database schema: %w", err)
+		}
+		rootLogger.Info("Database schema initialized successfully.")
+
+		// Handle closing the log file if it was opened (best effort in PostRun)
+		// Note: This relies on the logFileHandle variable being accessible in PostRun.
+		// A cleaner way might involve storing it in the command's context or a global registry.
+		cmd.PersistentPostRunE = func(cmd *cobra.Command, args []string) error {
+			if dbConn != nil {
+				rootLogger.Info("Closing DuckDB connection.")
+				if err := dbConn.Close(); err != nil {
+					rootLogger.Error("Failed to close DuckDB connection cleanly", "error", err)
+				}
+			}
+			if logFileHandle != nil {
+				rootLogger.Debug("Closing log file handle.") // Log before closing
+				if err := logFileHandle.Close(); err != nil {
+					// Log error closing file, but don't fail command exit
+					fmt.Fprintf(os.Stderr, "Error closing log file: %v\n", err)
+				}
+			}
+			return nil
+		}
+
+		return nil
+	},
+	// Remove PersistentPostRunE from here if defined within PersistentPreRunE
+	// PersistentPostRunE: func(cmd *cobra.Command, args []string) error { ... },
+}
+
+// Execute adds all child commands to the root command and sets flags appropriately.
+func Execute() {
+	// Add child commands here
+	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(inspectCmd)
+	rootCmd.AddCommand(analyseCmd)
+	rootCmd.AddCommand(stateCmd)
+
+	err := rootCmd.Execute()
+	if err != nil {
+		if rootLogger != nil {
+			rootLogger.Error("Command execution failed", "error", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Command execution failed: %v\n", err)
+		}
+		os.Exit(1)
+	}
+}
+
+func init() {
+	// Define persistent flags
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.nemparquet.yaml) (Not implemented yet)")
+	rootCmd.PersistentFlags().StringVarP(&inputDir, "input-dir", "i", "./input_csv", "Directory for downloaded zip files")
+	rootCmd.PersistentFlags().StringVarP(&outputDir, "output-dir", "o", "./output_parquet", "Directory for generated Parquet files")
+	rootCmd.PersistentFlags().StringVarP(&dbPath, "db-path", "d", "./nemparquet_state.duckdb", "Path to DuckDB state database file (:memory: for in-memory)")
+	rootCmd.PersistentFlags().IntVarP(&workers, "workers", "w", runtime.NumCPU(), "Number of concurrent workers for processing phase")
+	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log output format (text or json)") // Keep text as default
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().StringVar(&logOutput, "log-output", "stderr", "Log output destination (stderr, stdout, or file path)")
+	rootCmd.PersistentFlags().StringSliceVar(&feedUrls, "feed-url", config.DefaultFeedURLs, "Feed URLs to fetch discovery info from (can specify multiple)")
+	rootCmd.PersistentFlags().StringSliceVar(&archiveFeedUrls, "archive-feed-url", config.DefaultArchiveFeedURLs, "Feed URLs to fetch archive discovery info from (archives)")
+
+	rootCmd.Version = "0.2.2" // Incremented version
+}
+
+// Helper functions (Unchanged)
+func getLogger() *slog.Logger {
+	if rootLogger == nil {
+		return slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return rootLogger
+}
+func getDB() *sql.DB           { return dbConn }
+func getConfig() config.Config { return appConfig }
+
+
+##################################################
+# File: ./cmd/inspect.go
+##################################################
+package cmd
+
+import (
+	"fmt"
+
+	// Use your actual module path
+	"github.com/brensch/nemparquet/internal/inspector"
+
+	"github.com/spf13/cobra"
+)
+
+// inspectCmd represents the inspect command
+var inspectCmd = &cobra.Command{
+	Use:   "inspect",
+	Short: "Inspect schema and row counts of generated Parquet files using DuckDB",
+	Long:  `Connects to DuckDB (using the state DB path or in-memory) and inspects all *.parquet files found in the output directory. It shows the schema and row count for each file.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		logger := getLogger()
+		// Inspector might need config for OutputDir and potentially DbPath
+		cfg := getConfig()
+
+		logger.Info("Starting Parquet file inspection...")
+
+		// Pass logger and relevant config (DB path could be different for inspection if needed)
+		err := inspector.InspectParquet(cfg, logger) // Pass logger
+		if err != nil {
+			logger.Error("Inspection completed with errors", "error", err)
+			return fmt.Errorf("inspection failed: %w", err)
+		}
+
+		logger.Info("Parquet inspection completed successfully.")
+		return nil
+	},
+}
+
+// No specific flags for inspect needed currently
+func init() {
+}
+
+
+##################################################
+# File: ./cmd/analyse.go
+##################################################
+package cmd
+
+import (
+	"context"
+	"fmt"
+
+	// Use your actual module path and spelling
+	"github.com/brensch/nemparquet/internal/analyser"
+
+	"github.com/spf13/cobra"
+)
+
+// analyseCmd represents the analyse command
+var analyseCmd = &cobra.Command{
+	Use:   "analyse", // Use 's'
+	Short: "Run pre-defined FPP analysis on Parquet data using DuckDB",
+	Long:  `Connects to DuckDB and executes a pre-defined analysis script (currently FPP calculation for April 2025) using the Parquet files in the output directory as input views.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		logger := getLogger()
+		// Analyser needs config for OutputDir and DbPath
+		cfg := getConfig()
+
+		logger.Info("Starting DuckDB FPP analysis...")
+
+		// Pass logger and config
+		err := analyser.RunAnalysis(context.Background(), cfg, logger) // Pass context, logger
+		if err != nil {
+			logger.Error("Analysis completed with errors", "error", err)
+			return fmt.Errorf("analysis failed: %w", err)
+		}
+
+		logger.Info("DuckDB analysis completed successfully.")
+		return nil
+	},
+}
+
+// No specific flags for analyse needed currently
+func init() {
+}
+
+
+##################################################
+# File: ./main.go
+##################################################
+package main
+
+import (
+	// Use your actual module path here
+	"github.com/brensch/nemparquet/cmd"
+)
+
+func main() {
+	// Execute the root Cobra command
+	cmd.Execute()
+}
+
+
+>>> Finished printing .go files.

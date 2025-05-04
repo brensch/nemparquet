@@ -3,12 +3,12 @@ package config
 // DefaultFeedURLs lists the standard NEMWEB "Current" directories containing individual data zip files.
 // Can be overridden by the --feed-url flag.
 var DefaultFeedURLs = []string{
-	"https://nemweb.com.au/Reports/Current/FPP/",
-	"https://nemweb.com.au/Reports/Current/FPPDAILY/",
-	"https://nemweb.com.au/Reports/Current/FPPRATES/",
+	// "https://nemweb.com.au/Reports/Current/FPP/",
+	// "https://nemweb.com.au/Reports/Current/FPPDAILY/",
+	// "https://nemweb.com.au/Reports/Current/FPPRATES/",
 	"https://nemweb.com.au/Reports/Current/FPPRUN/",
-	"https://nemweb.com.au/Reports/Current/PD7Day/",
-	"https://nemweb.com.au/Reports/Current/P5_Reports/",
+	// "https://nemweb.com.au/Reports/Current/PD7Day/",
+	// "https://nemweb.com.au/Reports/Current/P5_Reports/",
 }
 
 // DefaultArchiveFeedURLs lists the NEMWEB "Archive" directories potentially containing zip files of zip files.
