@@ -20,60 +20,69 @@ type SchemaInfo struct {
 	NemTimeColIdx map[int]bool // Indices of columns detected as NEMDateTime
 }
 
-const maxInferenceRows = 10 // How many 'D' rows to check for schema inference
+const maxInferenceRows = 10 // Total 'D' rows to check (including the first one)
 
-// inferSchema analyzes subsequent 'D' rows from the scanner to determine column names and DuckDB types.
-// It reads up to maxInferenceRows or until a fully populated row is found, or a non-'D' record is encountered.
-// It consumes the rows it reads from the scanner.
-func inferSchema(scanner *util.PeekableScanner, headerRow []string, logger *slog.Logger) (*SchemaInfo, error) {
-	if len(headerRow) < 4 { // Need at least I, group, table, version + one column
+// inferSchema analyzes the first triggering 'D' row and subsequent 'D' rows from the scanner
+// to determine column names and DuckDB types.
+// It reads up to maxInferenceRows-1 additional rows or until a non-'D' record is encountered.
+// It consumes the additional rows it reads from the scanner.
+func inferSchema(
+	scanner *util.PeekableScanner, // Scanner positioned *after* the first triggering D row
+	headerRow []string, // The 'I' record fields
+	firstDataRow []string, // The first 'D' record fields that triggered inference
+	logger *slog.Logger,
+) (*SchemaInfo, error) {
+
+	if len(headerRow) < 4 {
 		return nil, fmt.Errorf("header row has insufficient columns (%d) for schema inference", len(headerRow))
 	}
-
-	// Column names are from the header row, starting after I, group, table, version
 	colNames := headerRow[4:]
 	numCols := len(colNames)
 	if numCols == 0 {
 		return nil, fmt.Errorf("header row contains no data column names after mandatory fields")
 	}
+	if len(firstDataRow) != numCols+4 {
+		return nil, fmt.Errorf("first data row length (%d) does not match header length (%d + 4)", len(firstDataRow), numCols)
+	}
 
 	duckdbTypes := make([]string, numCols) // Store the best inferred type
 	nemTimeCols := make(map[int]bool)
 	seenNonEmpty := make([]bool, numCols) // Track if we've seen *any* non-empty value for a column
-	rowsScanned := 0
+	rowsProcessed := 0
 
-	logger.Debug("Starting row-by-row schema inference.", "max_rows", maxInferenceRows)
+	// --- Process the first triggering data row ---
+	logger.Debug("Inferring schema starting with the first data row.")
+	processRowForInference(firstDataRow[4:], duckdbTypes, nemTimeCols, seenNonEmpty)
+	rowsProcessed++
 
-	for rowsScanned < maxInferenceRows {
+	// --- Process subsequent rows using the scanner ---
+	logger.Debug("Scanning subsequent rows for schema inference.", "max_additional_rows", maxInferenceRows-1)
+	for rowsProcessed < maxInferenceRows {
 		// Peek first to see if the next record is 'D'
 		nextRecordType, peekErr := scanner.PeekRecordType()
 		if peekErr != nil {
 			if errors.Is(peekErr, io.EOF) {
 				logger.Debug("EOF reached during schema inference scan.")
-				break // End of file, infer based on what we have
+				break // End of file
 			}
-			// Some other scanner error occurred during peek
 			logger.Error("Scanner error during peek in schema inference.", "error", peekErr)
-			return nil, fmt.Errorf("scanner peek error during inference: %w", peekErr)
+			// Don't return error yet, try to finalize based on what we have
+			break
 		}
 
 		if nextRecordType != "D" {
 			logger.Debug("Non-'D' record encountered during inference scan, stopping.", "record_type", nextRecordType)
-			break // Stop inference if we hit the next 'I' or 'C' or something else
+			break // Stop inference
 		}
 
 		// Peek successful and it's a 'D' row, now actually Scan it
 		if !scanner.Scan() {
-			// Error occurred during Scan (or EOF, though peek should have caught EOF)
 			scanErr := scanner.Err()
 			logger.Error("Scanner error during scan in schema inference.", "error", scanErr)
-			if scanErr == nil { // Should not happen if Scan returns false, but safety check
-				scanErr = io.EOF
-			}
-			// Don't return error yet, try to infer based on rows scanned so far
+			// Don't return error yet, try to finalize
 			break
 		}
-		rowsScanned++
+		rowsProcessed++ // Increment total rows processed (including the first one)
 		line := scanner.Text()
 
 		// Parse the 'D' row
@@ -82,82 +91,23 @@ func inferSchema(scanner *util.PeekableScanner, headerRow []string, logger *slog
 		r.TrimLeadingSpace = true
 		fields, err := r.Read()
 		if err != nil {
-			logger.Warn("Failed to parse CSV line during inference, skipping row.", "row_num_in_scan", rowsScanned, "error", err)
+			logger.Warn("Failed to parse CSV line during inference, skipping row.", "row_num_in_scan", rowsProcessed, "error", err)
 			continue // Skip this row for inference
 		}
 
 		if len(fields) != numCols+4 {
-			logger.Warn("Schema inference row length mismatch, skipping row.", "row_num_in_scan", rowsScanned, "expected_cols", numCols+4, "actual_cols", len(fields))
+			logger.Warn("Schema inference row length mismatch, skipping row.", "row_num_in_scan", rowsProcessed, "expected_cols", numCols+4, "actual_cols", len(fields))
 			continue
 		}
 
-		dataPortion := fields[4:]
-		isCompleteRow := true // Assume complete until proven otherwise
+		// Process this subsequent row
+		processRowForInference(fields[4:], duckdbTypes, nemTimeCols, seenNonEmpty)
 
-		// Update types based on this row
-		for j, val := range dataPortion {
-			trimmedVal := strings.Trim(val, `" `)
+	} // End loop scanning subsequent rows
 
-			if trimmedVal == "" {
-				isCompleteRow = false // Found an empty field
-				// Don't update type based on empty, but continue checking other columns
-				continue
-			}
+	logger.Info("Schema inference scan finished.", "rows_processed_for_inference", rowsProcessed)
 
-			seenNonEmpty[j] = true // Mark that we've seen data for this column
-
-			// Infer type for this value
-			currentValType := "VARCHAR" // Default for this value
-			if util.IsNEMDateTime(trimmedVal) {
-				currentValType = "TIMESTAMP_MS"
-				nemTimeCols[j] = true // Mark as NEM time regardless of current inferred type
-			} else if _, err := strconv.ParseInt(trimmedVal, 10, 64); err == nil {
-				currentValType = "BIGINT"
-			} else if _, err := strconv.ParseFloat(trimmedVal, 64); err == nil {
-				currentValType = "DOUBLE"
-			}
-
-			// Update the overall best type for the column
-			existingType := duckdbTypes[j]
-			if existingType == "" || existingType == "VARCHAR" {
-				duckdbTypes[j] = currentValType // Upgrade from nothing or VARCHAR
-			} else if existingType == "BIGINT" && currentValType == "DOUBLE" {
-				duckdbTypes[j] = "DOUBLE" // Upgrade BIGINT to DOUBLE
-			} else if existingType == "BIGINT" && currentValType == "TIMESTAMP_MS" {
-				duckdbTypes[j] = "TIMESTAMP_MS" // Upgrade BIGINT to TIMESTAMP_MS
-			} else if existingType == "DOUBLE" && currentValType == "TIMESTAMP_MS" {
-				duckdbTypes[j] = "TIMESTAMP_MS" // Upgrade DOUBLE to TIMESTAMP_MS
-			}
-			// Note: We don't downgrade (e.g., from DOUBLE to BIGINT)
-			// If a column is marked NEMTime, ensure final type is TIMESTAMP_MS
-			if _, isNemCol := nemTimeCols[j]; isNemCol {
-				duckdbTypes[j] = "TIMESTAMP_MS"
-			}
-		} // End loop through columns for this row
-
-		// Check if this was a complete row
-		if isCompleteRow {
-			logger.Info("Found complete row during inference, finalizing schema.", "row_num_in_scan", rowsScanned)
-			// Finalize any remaining unset types (shouldn't happen with complete row, but safety)
-			for j := 0; j < numCols; j++ {
-				if duckdbTypes[j] == "" {
-					logger.Warn("Column type still empty after finding complete row, defaulting to VARCHAR.", "column_index", j)
-					duckdbTypes[j] = "VARCHAR"
-				}
-			}
-			return &SchemaInfo{
-				ColumnNames:   colNames,
-				DuckdbTypes:   duckdbTypes,
-				NemTimeColIdx: nemTimeCols,
-			}, nil // Return immediately with schema based on complete row
-		}
-
-	} // End loop scanning rows
-
-	logger.Info("Schema inference scan finished.", "rows_scanned", rowsScanned)
-
-	// If loop finished (max rows reached or non-'D' found) without finding a complete row,
-	// finalize types based on what was seen. Default unseen columns to VARCHAR.
+	// Finalize types: Default any column where no non-empty value was ever seen to VARCHAR.
 	for j := 0; j < numCols; j++ {
 		if !seenNonEmpty[j] {
 			logger.Debug("Column never saw non-empty data during inference, defaulting to VARCHAR.", "column_index", j, "column_name", colNames[j])
@@ -177,7 +127,7 @@ func inferSchema(scanner *util.PeekableScanner, headerRow []string, logger *slog
 		}
 	}
 
-	logger.Info("Schema inferred (no complete row found).", "columns", colNames, "types", duckdbTypes)
+	logger.Info("Schema inferred.", "columns", colNames, "types", duckdbTypes)
 	return &SchemaInfo{
 		ColumnNames:   colNames,
 		DuckdbTypes:   duckdbTypes,
@@ -185,9 +135,53 @@ func inferSchema(scanner *util.PeekableScanner, headerRow []string, logger *slog
 	}, nil
 }
 
-// parseDataRow parses a 'D' record based on the inferred schema.
-// It handles type conversions, including NEMDateTime to epoch milliseconds.
-// (No changes needed from previous version based on the new inference logic)
+// processRowForInference updates the inferred types based on a single data row portion.
+func processRowForInference(dataPortion []string, duckdbTypes []string, nemTimeCols map[int]bool, seenNonEmpty []bool) {
+	numCols := len(duckdbTypes)
+	if len(dataPortion) != numCols {
+		// Log mismatch if necessary, but function should be called with correct slice length
+		return
+	}
+
+	for j, val := range dataPortion {
+		trimmedVal := strings.Trim(val, `" `)
+
+		if trimmedVal == "" {
+			continue // Skip empty fields for type inference update
+		}
+
+		seenNonEmpty[j] = true // Mark that we've seen data for this column
+
+		// Infer type for this specific value
+		currentValType := "VARCHAR" // Default for this value
+		isNemTime := false
+		if util.IsNEMDateTime(trimmedVal) {
+			currentValType = "TIMESTAMP_MS"
+			isNemTime = true
+			nemTimeCols[j] = true // Mark as NEM time
+		} else if _, err := strconv.ParseInt(trimmedVal, 10, 64); err == nil {
+			currentValType = "BIGINT"
+		} else if _, err := strconv.ParseFloat(trimmedVal, 64); err == nil {
+			currentValType = "DOUBLE"
+		}
+
+		// Update the overall best type for the column based on hierarchy
+		existingType := duckdbTypes[j]
+		if existingType == "" || existingType == "VARCHAR" {
+			duckdbTypes[j] = currentValType
+		} else if existingType == "BIGINT" && (currentValType == "DOUBLE" || currentValType == "TIMESTAMP_MS") {
+			duckdbTypes[j] = currentValType // Upgrade BIGINT
+		} else if existingType == "DOUBLE" && currentValType == "TIMESTAMP_MS" {
+			duckdbTypes[j] = currentValType // Upgrade DOUBLE
+		}
+		// Ensure NEM time columns end up as TIMESTAMP_MS
+		if isNemTime {
+			duckdbTypes[j] = "TIMESTAMP_MS"
+		}
+	}
+}
+
+// parseDataRow remains the same as before
 func parseDataRow(rowData []string, schema *SchemaInfo, logger *slog.Logger) ([]any, error) {
 	if len(rowData) != len(schema.ColumnNames)+4 {
 		return nil, fmt.Errorf("data row length (%d) does not match schema length (%d + 4)", len(rowData), len(schema.ColumnNames))
@@ -210,47 +204,42 @@ func parseDataRow(rowData []string, schema *SchemaInfo, logger *slog.Logger) ([]
 
 		switch colType {
 		case "TIMESTAMP_MS":
-			// Check if it's explicitly marked or just inferred
-			if _, isMarked := schema.NemTimeColIdx[i]; isMarked || util.IsNEMDateTime(trimmedVal) {
+			_, isNemCol := schema.NemTimeColIdx[i]
+			if isNemCol || util.IsNEMDateTime(trimmedVal) {
 				epochMs, parseErr := util.NEMDateTimeToEpochMS(trimmedVal)
 				if parseErr != nil {
 					logger.Warn("Failed to parse NEMDateTime, setting NULL.", "value", val, "column", schema.ColumnNames[i], "error", parseErr)
-					parsedVal = nil // Insert NULL on parse failure
+					parsedVal = nil
 				} else {
-					// Convert epoch milliseconds to time.Time for DuckDB TIMESTAMP_MS
-					// Ensure it's stored as UTC in the database if timezone matters downstream
 					parsedVal = time.UnixMilli(epochMs).UTC()
 				}
 			} else {
-				// If type is TIMESTAMP_MS but not NEM format, treat as VARCHAR? Or error?
 				logger.Warn("Column type is TIMESTAMP_MS but value is not NEM format, treating as VARCHAR.", "value", val, "column", schema.ColumnNames[i])
-				parsedVal = trimmedVal // Store original string
+				parsedVal = trimmedVal
 			}
 		case "BIGINT":
 			parsedVal, err = strconv.ParseInt(trimmedVal, 10, 64)
 			if err != nil {
 				logger.Warn("Failed to parse BIGINT, setting NULL.", "value", val, "column", schema.ColumnNames[i], "error", err)
-				parsedVal = nil // Insert NULL on parse failure
+				parsedVal = nil
 			}
 		case "DOUBLE":
 			parsedVal, err = strconv.ParseFloat(trimmedVal, 64)
 			if err != nil {
 				logger.Warn("Failed to parse DOUBLE, setting NULL.", "value", val, "column", schema.ColumnNames[i], "error", err)
-				parsedVal = nil // Insert NULL on parse failure
+				parsedVal = nil
 			}
 		case "VARCHAR":
-			fallthrough // Treat as VARCHAR by default
+			fallthrough
 		default:
-			// Ensure the string doesn't contain null bytes, which DuckDB might reject
 			if strings.ContainsRune(trimmedVal, 0) {
 				logger.Warn("Replacing null byte in VARCHAR data", "column", schema.ColumnNames[i])
-				parsedVal = strings.ReplaceAll(trimmedVal, "\x00", "") // Replace null bytes
+				parsedVal = strings.ReplaceAll(trimmedVal, "\x00", "")
 			} else {
-				parsedVal = trimmedVal // Store as string
+				parsedVal = trimmedVal
 			}
 		}
 
-		// If an error occurred during specific parsing (and we didn't set NULL), return it
 		if err != nil && parsedVal != nil {
 			return nil, fmt.Errorf("parsing value '%s' for column '%s' as %s: %w", val, schema.ColumnNames[i], colType, err)
 		}

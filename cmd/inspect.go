@@ -22,7 +22,7 @@ var inspectCmd = &cobra.Command{
 		logger.Info("Starting Parquet file inspection...")
 
 		// Pass logger and relevant config (DB path could be different for inspection if needed)
-		err := inspector.InspectParquet(cfg, logger) // Pass logger
+		err := inspector.InspectDuckDB(cfg, logger) // Pass logger
 		if err != nil {
 			logger.Error("Inspection completed with errors", "error", err)
 			return fmt.Errorf("inspection failed: %w", err)

@@ -3,13 +3,17 @@ package orchestrator
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha1" // For hashing column names
 	"database/sql"
 	"encoding/csv"
+	"encoding/hex" // For encoding hash
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
+
+	// "reflect" // No longer needed
 	"strings"
 	"sync" // For schema cache mutex
 	"time" // For result channel timeout
@@ -19,13 +23,24 @@ import (
 	"github.com/brensch/nemparquet/internal/util"
 )
 
-// Global cache for schemas. Key: tableName (group__table__version), Value: *SchemaInfo
+// Global cache for schemas. Key: tableName (group__table__version__colhash), Value: *SchemaInfo
 var schemaCacheMap = make(map[string]*SchemaInfo)
 var schemaCacheMutex sync.Mutex // Mutex to protect schemaCacheMap
 
+// generateTableName creates a unique table name including a hash of the column names.
+func generateTableName(group, table, version string, columnNames []string) string {
+	colString := strings.Join(columnNames, "|-|")
+	hasher := sha1.New()
+	hasher.Write([]byte(colString))
+	colHash := hex.EncodeToString(hasher.Sum(nil))[:10]
+	cleanGroup := strings.ReplaceAll(group, "-", "_")
+	cleanTable := strings.ReplaceAll(table, "-", "_")
+	cleanVersion := strings.ReplaceAll(version, "-", "_")
+	return fmt.Sprintf("%s__%s__%s__%s", cleanGroup, cleanTable, cleanVersion, colHash)
+}
+
 // processZip handles unzipping, parsing, schema inference/creation, and data appending for a single zip file.
-// It uses a mutex to serialize schema inference and creation checks per table name.
-// Schema inference now reads directly from the scanner row-by-row.
+// Table names now include a hash of column names. Inference considers the first D row.
 func processZip(
 	ctx context.Context,
 	cfg config.Config,
@@ -78,10 +93,9 @@ func processZip(
 	maxScanTokenSize := bufferSize
 	scanner.Buffer(make([]byte, bufferSize), maxScanTokenSize)
 
-	var currentSchema *SchemaInfo
-	var currentTableName string
-	var headerRow []string
-	// sampleRowsForInference is no longer needed
+	var currentSchema *SchemaInfo // The schema to use for the current block
+	var currentTableName string   // The specific table name for the current block (includes col hash)
+	var headerRowFields []string  // Fields from the most recent 'I' record
 
 	lineNumber := 0
 	for scanner.Scan() {
@@ -115,8 +129,7 @@ func processZip(
 
 		if recordType == "I" {
 			l.Debug("Processing 'I' record.", "line", lineNumber)
-			// sampleRowsForInference = [][]string{} // No longer needed
-			headerRow = fields // Store header for potential inference
+			headerRowFields = fields // Store full header row
 
 			if len(fields) < 4 {
 				l.Warn("Skipping 'I' record with insufficient columns.", "line", lineNumber, "columns", len(fields))
@@ -136,52 +149,56 @@ func processZip(
 				currentTableName = ""
 				continue
 			}
-			tableName := fmt.Sprintf("%s__%s__%s", group, table, version)
-			currentTableName = tableName
-			currentSchema = nil // Reset schema, will check cache or infer below
+			fileColumns := headerRowFields[4:] // Extract column names
 
-			continue // Continue to next line ('D' or next 'I')
+			tableName := generateTableName(group, table, version, fileColumns)
+			currentTableName = tableName
+			currentSchema = nil // Reset schema, check cache below
+
+			schemaCacheMutex.Lock()
+			cachedSchema, found := schemaCacheMap[currentTableName]
+			schemaCacheMutex.Unlock()
+
+			if found {
+				l.Debug("Schema found in cache for table.", "table", currentTableName)
+				currentSchema = cachedSchema
+			} else {
+				l.Debug("Schema not in cache, inference required.", "table", currentTableName)
+				currentSchema = nil
+			}
+			continue
 		}
 
 		if recordType == "D" {
-			if currentTableName == "" || headerRow == nil {
-				l.Warn("Skipping 'D' record found before a valid 'I' record.", "line", lineNumber)
-				processingErr = errors.Join(processingErr, fmt.Errorf("line %d 'D' record without preceding 'I'", lineNumber))
+			if currentTableName == "" || headerRowFields == nil {
+				l.Warn("Skipping 'D' record found before a valid 'I' record or after schema error.", "line", lineNumber)
 				continue
 			}
 
-			// --- Schema Check/Inference/Creation Logic (Mutex Protected) ---
+			// --- Schema Inference/Creation Logic (if needed) ---
 			if currentSchema == nil {
-				// Need to determine schema for this block. Lock, check cache, infer/create if needed.
 				schemaCacheMutex.Lock()
 				schema, found := schemaCacheMap[currentTableName]
 				if found {
-					// Schema exists in cache
-					schemaCacheMutex.Unlock() // Unlock immediately after finding
-					l.Debug("Schema found in cache.", "table", currentTableName)
+					schemaCacheMutex.Unlock()
+					l.Debug("Schema found in cache after acquiring lock.", "table", currentTableName)
 					currentSchema = schema
 				} else {
-					// Schema not in cache. Keep lock, infer, create, store, unlock.
 					l.Info("Schema not in cache, performing inference/creation.", "table", currentTableName)
 
-					// Call the modified inferSchema, passing the scanner.
-					// It will consume the necessary 'D' rows.
-					inferredSchema, inferErr := inferSchema(scanner, headerRow, l)
-					// Scanner position is now after the rows consumed by inferSchema.
+					// Call inferSchema, passing the *current* 'D' row fields ('fields')
+					// and the scanner (positioned *after* the current row).
+					inferredSchema, inferErr := inferSchema(scanner, headerRowFields, fields, l)
+					// Scanner position is now after any additional rows consumed by inferSchema.
 
 					if inferErr != nil {
-						schemaCacheMutex.Unlock() // Unlock on error
+						schemaCacheMutex.Unlock()
 						l.Error("Schema inference failed.", "table", currentTableName, "error", inferErr)
 						processingErr = errors.Join(processingErr, fmt.Errorf("schema inference %s: %w", currentTableName, inferErr))
 						currentSchema = nil
 						currentTableName = ""
-						headerRow = nil // Invalidate block
-						// Need to reprocess the current line if inference failed?
-						// The current line was already consumed by inferSchema if it was a 'D' row.
-						// If inferSchema failed *before* consuming this line (e.g., header error),
-						// then we might process it incorrectly below.
-						// Safest is to invalidate and continue to the *next* line from the scanner.
-						continue
+						headerRowFields = nil
+						continue // Continue to the next line from the scanner
 					}
 
 					// Send request to create table and wait for result *while holding lock*
@@ -194,14 +211,14 @@ func processZip(
 					case schemaChan <- createReq:
 						l.Debug("Waiting for schema creation result.", "table", currentTableName)
 						select {
-						case createErr = <-resultChan: // Blocks until resultChan is closed
+						case createErr = <-resultChan:
 							if createErr != nil {
 								l.Error("Schema creation worker reported error.", "table", currentTableName, "error", createErr)
 								processingErr = errors.Join(processingErr, fmt.Errorf("schema create %s: %w", currentTableName, createErr))
 							} else {
 								l.Info("Schema creation successful. Caching schema.", "table", currentTableName)
-								schemaCacheMap[currentTableName] = inferredSchema // Store in map
-								currentSchema = inferredSchema                    // Set for current processing
+								schemaCacheMap[currentTableName] = inferredSchema
+								currentSchema = inferredSchema
 							}
 						case <-ctx.Done():
 							createErr = ctx.Err()
@@ -214,33 +231,25 @@ func processZip(
 						processingErr = errors.Join(processingErr, createErr)
 					}
 
-					schemaCacheMutex.Unlock() // Unlock *after* inference, creation attempt, and cache update
+					schemaCacheMutex.Unlock()
 
-					// If creation failed or was cancelled, invalidate the block and continue
 					if createErr != nil {
 						currentSchema = nil
 						currentTableName = ""
-						headerRow = nil
-						// Scanner is already past the inference rows, continue to next line
-						continue
+						headerRowFields = nil
+						continue // Continue to the next line from the scanner
 					}
 				} // End of cache miss handling
 			} // End of if currentSchema == nil
 
 			// --- Data Row Processing ---
-			// NOTE: The current 'D' row might have been consumed by inferSchema if it was within the inference window.
-			// We need to process the *current* `fields` only if it wasn't consumed during inference.
-			// However, the current logic calls inferSchema *within* the loop iteration for the first D row
-			// that triggers the cache miss. inferSchema then consumes subsequent rows.
-			// This means the D row that *triggered* the inference still needs processing after the schema is ready.
-
 			if currentSchema != nil {
-				// Process the 'fields' from the current scanner line
+				// Process the 'fields' from the current scanner line.
 				parsedRow, parseErr := parseDataRow(fields, currentSchema, l)
 				if parseErr != nil {
 					l.Warn("Failed to parse data row, skipping.", "line", lineNumber, "error", parseErr)
 					processingErr = errors.Join(processingErr, fmt.Errorf("line %d parse data: %w", lineNumber, parseErr))
-					continue // Skip this row
+					continue
 				}
 
 				writeOp := WriteOperation{TableName: currentTableName, Data: parsedRow}
@@ -251,10 +260,9 @@ func processZip(
 					l.Warn("Context cancelled while sending data row to writer.", "line", lineNumber, "error", ctx.Err())
 					processingErr = errors.Join(processingErr, ctx.Err())
 					db.LogFileEvent(ctx, dbConnPool, zipFilePath, db.FileTypeZip, db.EventError, "", zipFilePath, fmt.Sprintf("Processing cancelled: %v", ctx.Err()), "", nil)
-					return processingErr // Exit function on cancellation during write
+					return processingErr
 				}
 			} else {
-				// Schema wasn't ready - implies an issue during lock/check/create phase
 				l.Warn("Skipping 'D' record because schema is not ready (error during inference/create).", "line", lineNumber, "table", currentTableName)
 				processingErr = errors.Join(processingErr, fmt.Errorf("line %d 'D' record schema not ready for table %s", lineNumber, currentTableName))
 			}
@@ -277,5 +285,3 @@ func processZip(
 	db.LogFileEvent(ctx, dbConnPool, zipFilePath, db.FileTypeZip, db.EventProcessEnd, "", zipFilePath, "Processing successful", "", &duration)
 	return nil
 }
-
-// Removed placeholder peekRemainingData function

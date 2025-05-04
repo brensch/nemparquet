@@ -16,7 +16,7 @@ var DefaultFeedURLs = []string{
 var DefaultArchiveFeedURLs = []string{
 	// "https://nemweb.com.au/Reports/Archive/FPPDAILY/",
 	// "https://nemweb.com.au/Reports/Archive/FPPRATES/",
-	"https://nemweb.com.au/Reports/Archive/FPPRUN/", // Contains historical FPP_RCR data
+	// "https://nemweb.com.au/Reports/Archive/FPPRUN/", // Contains historical FPP_RCR data
 	// "https://nemweb.com.au/Reports/Archive/P5_Reports/",
 }
 
