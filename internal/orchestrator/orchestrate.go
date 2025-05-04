@@ -7,18 +7,19 @@ import (
 	"fmt"
 	"log/slog"
 	"os/signal"
-	"path/filepath"
+	"path/filepath" // Import filepath
 	"runtime"
 	"sync"
 	"syscall"
 
+	// Import time
 	"github.com/brensch/nemparquet/internal/config"
 	"github.com/brensch/nemparquet/internal/db"
 	"github.com/brensch/nemparquet/internal/util"
-	// No longer needs semaphore
+	_ "github.com/marcboeker/go-duckdb" // Ensure driver is registered
 )
 
-// extractionJob defined previously (can be kept or removed if not used elsewhere)
+// extractionJob holds the data needed for an extraction task.
 type extractionJob struct {
 	archiveURL string
 	data       []byte
@@ -32,31 +33,32 @@ type processingJob struct {
 }
 
 // RunCombinedWorkflow orchestrates discovery, download, extraction, and processing.
-// Uses dedicated workers for schema creation, data writing, extraction, and processing.
+// Uses dedicated workers for schema creation, data writing, extraction, and processing,
+// drawing connections from a shared sql.DB pool.
 func RunCombinedWorkflow(appCtx context.Context, cfg config.Config, dbConnPool *sql.DB, logger *slog.Logger, forceDownload, forceProcess bool) error {
-	logger.Info("Starting main orchestration workflow (full pipeline)...")
+	// Note: The input dbConnPool is now the primary pool used throughout.
+	// We assume it's already initialized and passed correctly.
+	// If dbConnPool was *only* for logging before, we might need to initialize
+	// the main operational pool here instead. Assuming dbConnPool is the intended operational pool.
+
+	logger.Info("Starting main orchestration workflow (shared pool)...")
 
 	ctx, stop := signal.NotifyContext(appCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	client := util.DefaultHTTPClient()
 
-	// --- Phase 0: Get Completed Archives/Zips from DB ---
-	// Get completed *outer* archives for skipping download/extraction
+	// --- Phase 0: Get Completed Archives/Zips from DB (using the shared pool) ---
 	completedOuterArchives := make(map[string]bool)
 	var initialDbErr error
-	if !forceProcess && !forceDownload { // Skip DB check if forcing either download or process
-		completedOuterArchives, initialDbErr = db.GetCompletedArchiveURLs(ctx, dbConnPool, logger) // Uses db package func
+	if !forceProcess && !forceDownload {
+		completedOuterArchives, initialDbErr = db.GetCompletedArchiveURLs(ctx, dbConnPool, logger)
 		if initialDbErr != nil {
 			logger.Error("Failed to get completed outer archives from DB, proceeding without skip check.", "error", initialDbErr)
 		}
 	} else {
 		logger.Info("Forcing download/process, skipping DB check for completed archives.")
 	}
-	// Get completed *inner* zips for potentially skipping processing step later (optional optimization)
-	// completedInnerZips, dbErrInner := db.GetCompletedInnerZips(ctx, dbConnPool, logger) // Requires a new DB function
-	// initialDbErr = errors.Join(initialDbErr, dbErrInner)
-
 	if ctx.Err() != nil {
 		logger.Warn("Context cancelled during initial DB check.", "error", ctx.Err())
 		return errors.Join(initialDbErr, ctx.Err())
@@ -82,55 +84,51 @@ func RunCombinedWorkflow(appCtx context.Context, cfg config.Config, dbConnPool *
 	}
 
 	// --- Setup Worker Pools and Channels ---
-	var processingErrorsMu sync.Mutex // Mutex for the shared error slice
-	var processingErrors []error      // Collect errors from all stages
+	var processingErrorsMu sync.Mutex
+	var processingErrors []error
 
 	var extractWg sync.WaitGroup
 	var processWg sync.WaitGroup
-	var writerWg sync.WaitGroup  // For DuckDB writer
-	var creatorWg sync.WaitGroup // For Schema creator
+	var writerWg sync.WaitGroup
+	var creatorWg sync.WaitGroup
 
-	// Determine worker counts
 	numExtractWorkers := runtime.NumCPU()
-	numProcessWorkers := runtime.NumCPU() // Can be tuned separately
+	numProcessWorkers := runtime.NumCPU()
 	if numExtractWorkers < 1 {
 		numExtractWorkers = 1
 	}
 	if numProcessWorkers < 1 {
 		numProcessWorkers = 1
 	}
-	// Add config options? cfg.NumExtractWorkers, cfg.NumProcessWorkers
 
-	// Channels
-	// Increase buffer size? Depends on typical number of inner zips per outer archive.
-	extractJobsChan := make(chan extractionJob, numExtractWorkers*2)      // Jobs for extraction workers
-	processingJobsChan := make(chan processingJob, numProcessWorkers*2)   // Jobs for processing workers
-	writeDataChan := make(chan WriteOperation, numProcessWorkers*10)      // Data rows for DuckDB writer (buffer size depends on row rate)
-	schemaCreateChan := make(chan SchemaCreateRequest, numProcessWorkers) // Schema creation requests
+	extractJobsChan := make(chan extractionJob, numExtractWorkers*2)
+	processingJobsChan := make(chan processingJob, numProcessWorkers*2)
+	writeDataChan := make(chan WriteOperation, numProcessWorkers*10)
+	schemaCreateChan := make(chan SchemaCreateRequest, numProcessWorkers)
 
 	logger.Info("Initializing workers.",
 		slog.Int("extract_workers", numExtractWorkers),
 		slog.Int("process_workers", numProcessWorkers),
 	)
 
-	// Start DuckDB Writer Goroutine (Single)
+	// Start DuckDB Writer Goroutine (passing the shared pool)
 	writerWg.Add(1)
-	go runDuckDBWriter(ctx, cfg.DbPath, logger.With(slog.String("component", "writer")), writeDataChan, &writerWg)
+	// Pass dbConnPool (the *sql.DB pool)
+	go runDuckDBWriter(ctx, dbConnPool, logger.With(slog.String("component", "writer")), writeDataChan, &writerWg)
 
-	// Start Schema Creator Goroutine (Single)
+	// Start Schema Creator Goroutine (passing the shared pool)
 	creatorWg.Add(1)
-	go runSchemaCreator(ctx, cfg.DbPath, logger.With(slog.String("component", "schema_creator")), schemaCreateChan, &creatorWg)
+	// Pass dbConnPool (the *sql.DB pool)
+	go runSchemaCreator(ctx, dbConnPool, logger.With(slog.String("component", "schema_creator")), schemaCreateChan, &creatorWg)
 
 	// Start Extraction Workers
 	for i := 0; i < numExtractWorkers; i++ {
-		// Pass processingJobsChan to the extraction worker
 		go extractionWorker(ctx, cfg, dbConnPool, logger, &extractWg, &processingErrorsMu, &processingErrors, processingJobsChan, extractJobsChan, i)
 	}
 
 	// Start Processing Workers
 	for i := 0; i < numProcessWorkers; i++ {
 		processWg.Add(1)
-		// Pass schemaCreateChan and writeDataChan to the processing worker
 		go processingWorker(ctx, cfg, dbConnPool, logger, &processWg, &processingErrorsMu, &processingErrors, schemaCreateChan, writeDataChan, processingJobsChan, i)
 	}
 
@@ -149,19 +147,18 @@ func RunCombinedWorkflow(appCtx context.Context, cfg config.Config, dbConnPool *
 		select {
 		case <-ctx.Done():
 			logEntry.Warn("Orchestration cancelled during download loop.", "error", ctx.Err())
-			// No need to append error here, final check will catch ctx.Err()
-			goto cleanup // Use goto for cleanup phase
+			goto cleanup
 		default:
 		}
 
-		// Skip Check (Outer Archive)
+		// Skip Check
 		if completed, found := completedOuterArchives[url]; found && completed && !forceProcess && !forceDownload {
 			logEntry.Info("Skipping outer archive, already marked as completed in DB.")
 			totalSkippedCount++
 			continue
 		}
 
-		// Download Outer Archive
+		// Download
 		totalDownloadAttempts++
 		logEntry.Info("Attempting download.")
 		archiveData, downloadErr := DownloadArchive(ctx, cfg, dbConnPool, logEntry, client, url)
@@ -171,73 +168,67 @@ func RunCombinedWorkflow(appCtx context.Context, cfg config.Config, dbConnPool *
 			processingErrors = append(processingErrors, fmt.Errorf("download %s: %w", url, downloadErr))
 			processingErrorsMu.Unlock()
 			totalDownloadErrors++
-			continue // Continue to next URL
+			continue
 		}
 
 		// Dispatch Extraction Job
 		logEntry.Info("Download successful, dispatching job to extraction workers.")
 		totalExtractionDispatched++
-		extractWg.Add(1) // Increment WaitGroup *before* sending job
+		extractWg.Add(1)
 		select {
 		case extractJobsChan <- extractionJob{archiveURL: url, data: archiveData, logEntry: logEntry}:
 			// Job sent
 		case <-ctx.Done():
 			logEntry.Warn("Context cancelled while dispatching extraction job.", "error", ctx.Err())
-			extractWg.Done() // Decrement because job wasn't processed
-			// No need to append error here
-			goto cleanup // Use goto for cleanup phase
+			extractWg.Done()
+			goto cleanup
 		}
 	} // End download loop
 
 cleanup:
 	// --- Shutdown Sequence ---
 	logger.Info("Download loop finished. Closing extraction job channel.")
-	close(extractJobsChan) // Signal extraction workers: no more downloads
+	close(extractJobsChan)
 
 	logger.Info("Waiting for extraction workers to finish...")
-	extractWg.Wait() // Wait for all extractions to complete (and potentially dispatch processing jobs)
+	extractWg.Wait()
 	logger.Info("Extraction workers finished. Closing processing job channel.")
-	close(processingJobsChan) // Signal processing workers: no more zip files to process
+	close(processingJobsChan)
 
 	logger.Info("Waiting for processing workers to finish...")
-	processWg.Wait() // Wait for all processing jobs to complete
+	processWg.Wait()
 	logger.Info("Processing workers finished. Closing data write channel.")
-	close(writeDataChan) // Signal DuckDB writer: no more data rows
+	close(writeDataChan)
 
 	logger.Info("Waiting for DuckDB writer to finish...")
-	writerWg.Wait() // Wait for writer to flush and exit
+	writerWg.Wait()
 	logger.Info("DuckDB writer finished. Closing schema create channel.")
-	close(schemaCreateChan) // Signal Schema creator: no more requests
+	close(schemaCreateChan)
 
 	logger.Info("Waiting for Schema creator to finish...")
-	creatorWg.Wait() // Wait for schema creator to exit
+	creatorWg.Wait()
 	logger.Info("Schema creator finished.")
 
 	// --- Final Summary ---
-	processingErrorsMu.Lock() // Lock to read final error count
+	processingErrorsMu.Lock()
 	numProcessingErrors := len(processingErrors)
 	finalError := errors.Join(processingErrors...)
-	processingErrorsMu.Unlock() // Unlock
+	processingErrorsMu.Unlock()
 
-	// Combine with initial discovery/DB error
 	if discoveryErr != nil {
 		finalError = errors.Join(discoveryErr, finalError)
 	}
-	// Add context error if cancellation happened
 	if ctx.Err() != nil && !errors.Is(finalError, ctx.Err()) {
 		finalError = errors.Join(finalError, ctx.Err())
 	}
 
-	// Log detailed summary counts
 	logger.Info("Orchestration finished.",
 		slog.Int("urls_discovered", len(archiveURLs)),
 		slog.Int("urls_skipped_db", totalSkippedCount),
 		slog.Int("download_attempts", totalDownloadAttempts),
 		slog.Int("download_errors", totalDownloadErrors),
 		slog.Int("extractions_dispatched", totalExtractionDispatched),
-		// Add counts for processing if needed (e.g., atomic counters in workers)
-		slog.Int("total_processing_errors", numProcessingErrors), // Combined errors from all stages
-		// slog.Int("total_inner_zips_extracted", len(allExtractedFiles)), // Need to collect this from extract workers if required
+		slog.Int("total_processing_errors", numProcessingErrors),
 	)
 
 	if finalError != nil {
@@ -253,14 +244,14 @@ cleanup:
 					containsOtherErrors = true
 				}
 			}
-			if numProcessingErrors > 0 && isCancellation {
+			processingErrorsMu.Lock() // Lock needed if accessing processingErrors slice
+			if len(processingErrors) > 0 && isCancellation {
 				// Check if the only error IS the cancellation error added at the end
-				processingErrorsMu.Lock() // Lock needed if accessing processingErrors slice
 				if !(len(processingErrors) == 1 && errors.Is(processingErrors[0], ctx.Err())) {
 					containsOtherErrors = true
 				}
-				processingErrorsMu.Unlock()
 			}
+			processingErrorsMu.Unlock()
 		}
 
 		if isCancellation && !containsOtherErrors {
@@ -280,7 +271,7 @@ cleanup:
 func extractionWorker(
 	ctx context.Context,
 	cfg config.Config,
-	dbConnPool *sql.DB,
+	dbConnPool *sql.DB, // Used for logging within ExtractInnerZips
 	baseLogger *slog.Logger,
 	wg *sync.WaitGroup,
 	mu *sync.Mutex, // Mutex for shared error slice
@@ -315,6 +306,7 @@ func extractionWorker(
 		} else {
 			workerLog.Info("Extraction successful, dispatching inner zips for processing.", slog.Int("count", len(extractedPaths)))
 			// Dispatch each successfully extracted file path for processing
+		dispatchLoop: // Label needed for breaking out of inner loop on context cancellation
 			for _, path := range extractedPaths {
 				procJob := processingJob{
 					zipFilePath: path,
@@ -327,10 +319,10 @@ func extractionWorker(
 					workerLog.Warn("Context cancelled while dispatching processing job.", "path", path, "error", ctx.Err())
 					// No need to add error here, main loop/final check handles ctx.Err()
 					// Need to break out of this inner loop if cancelled
-					goto endExtractionJob // Use goto to jump past the rest of the path dispatching for this job
+					break dispatchLoop // Break out of the path dispatching loop for this job
 				}
 			}
-		endExtractionJob: // Label to jump to after cancellation during path dispatch
+			// Removed endExtractionJob label as break dispatchLoop achieves the same
 		}
 
 		// Decrement WaitGroup *after* processing (and dispatching) is complete for this *extraction* job
@@ -344,7 +336,7 @@ func extractionWorker(
 func processingWorker(
 	ctx context.Context,
 	cfg config.Config,
-	dbConnPool *sql.DB,
+	dbConnPool *sql.DB, // Used for logging within processZip
 	baseLogger *slog.Logger,
 	wg *sync.WaitGroup,
 	mu *sync.Mutex, // Mutex for shared error slice
@@ -378,6 +370,7 @@ func processingWorker(
 		workerLog.Info("Processing zip file job.")
 
 		// Call the main processing function for the zip file
+		// Pass dbConnPool for logging purposes inside processZip
 		err := processZip(ctx, cfg, dbConnPool, workerLog, job.zipFilePath, schemaChan, writeChan)
 
 		if err != nil {
