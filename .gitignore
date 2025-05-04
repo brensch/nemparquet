@@ -28,3 +28,4 @@ input_csv/
 output_parquet/
 *.parquet
 *.zip
+*.duckdb*
