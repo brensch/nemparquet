@@ -194,6 +194,7 @@ func Execute() {
 	rootCmd.AddCommand(inspectCmd)
 	rootCmd.AddCommand(analyseCmd)
 	rootCmd.AddCommand(stateCmd)
+	rootCmd.AddCommand(saveCmd) // <<< Add this line
 
 	err := rootCmd.Execute()
 	if err != nil {
@@ -205,7 +206,6 @@ func Execute() {
 		os.Exit(1)
 	}
 }
-
 func init() {
 	// Define persistent flags
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.nemparquet.yaml) (Not implemented yet)")
