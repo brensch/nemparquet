@@ -5,16 +5,17 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
+	"log/slog" // Import http
 	"os/signal"
-	"path/filepath" // Import filepath
+	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"syscall"
 
-	// Import time
 	"github.com/brensch/nemparquet/internal/config"
 	"github.com/brensch/nemparquet/internal/db"
+	"github.com/brensch/nemparquet/internal/downloader"
 	"github.com/brensch/nemparquet/internal/util"
 	_ "github.com/marcboeker/go-duckdb" // Ensure driver is registered
 )
@@ -32,65 +33,84 @@ type processingJob struct {
 	logEntry    *slog.Logger // Logger context specific to this job's origin (optional)
 }
 
-// RunCombinedWorkflow orchestrates discovery, download, extraction, and processing.
-// Uses dedicated workers for schema creation, data writing, extraction, and processing,
-// drawing connections from a shared sql.DB pool.
+// RunCombinedWorkflow orchestrates discovery, download, extraction, and processing using predefined schemas.
+// Handles fatal schema validation errors by stopping the workflow.
 func RunCombinedWorkflow(appCtx context.Context, cfg config.Config, dbConnPool *sql.DB, logger *slog.Logger, forceDownload, forceProcess bool) error {
-	// Note: The input dbConnPool is now the primary pool used throughout.
-	// We assume it's already initialized and passed correctly.
-	// If dbConnPool was *only* for logging before, we might need to initialize
-	// the main operational pool here instead. Assuming dbConnPool is the intended operational pool.
+	logger.Info("Starting main orchestration workflow (predefined schemas)...")
 
-	logger.Info("Starting main orchestration workflow (shared pool)...")
-
-	ctx, stop := signal.NotifyContext(appCtx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// Use context with cancel for graceful shutdown AND fatal error propagation
+	ctx, stopFunc := signal.NotifyContext(appCtx, syscall.SIGINT, syscall.SIGTERM)
+	// It's crucial to call stopFunc eventually to release resources associated with NotifyContext
+	defer stopFunc()
 
 	client := util.DefaultHTTPClient()
 
-	// --- Phase 0: Get Completed Archives/Zips from DB (using the shared pool) ---
+	// --- Phase 0: Get Completed Files from DB ---
 	completedOuterArchives := make(map[string]bool)
+	completedZips := make(map[string]bool)
 	var initialDbErr error
-	if !forceProcess && !forceDownload {
-		completedOuterArchives, initialDbErr = db.GetCompletedArchiveURLs(ctx, dbConnPool, logger)
-		if initialDbErr != nil {
-			logger.Error("Failed to get completed outer archives from DB, proceeding without skip check.", "error", initialDbErr)
+	if !forceProcess {
+		if !forceDownload {
+			completedOuterArchives, initialDbErr = db.GetCompletedArchiveURLs(ctx, dbConnPool, logger)
+			if initialDbErr != nil {
+				logger.Error("Failed to get completed outer archives from DB.", "error", initialDbErr)
+			}
+		} else {
+			logger.Info("Force download enabled, skipping DB check for completed outer archives.")
 		}
+		var zipDbErr error
+		completedZips, zipDbErr = db.GetCompletedZipIdentifiers(ctx, dbConnPool, logger)
+		if zipDbErr != nil {
+			logger.Error("Failed to get completed zip identifiers from DB.", "error", zipDbErr)
+		}
+		initialDbErr = errors.Join(initialDbErr, zipDbErr)
 	} else {
-		logger.Info("Forcing download/process, skipping DB check for completed archives.")
+		logger.Info("Force process enabled, skipping DB checks.")
 	}
 	if ctx.Err() != nil {
 		logger.Warn("Context cancelled during initial DB check.", "error", ctx.Err())
 		return errors.Join(initialDbErr, ctx.Err())
 	}
 
-	// --- Phase 1: Discover Archive URLs ---
-	archiveURLs, discoveryErr := DiscoverArchiveURLs(ctx, cfg, logger)
-	discoveryErr = errors.Join(initialDbErr, discoveryErr) // Combine potential DB error
+	// --- Phase 1: Discover URLs ---
+	var discoveryErr error
+	var archiveURLs []string
+	var regularZipMap map[string]string
+	var regularZipURLs []string
+	var archiveDiscErr error
+	archiveURLs, archiveDiscErr = DiscoverArchiveURLs(ctx, cfg, logger) // Assumes this function exists in orchestrator package
+	discoveryErr = errors.Join(discoveryErr, archiveDiscErr)
+	if ctx.Err() != nil {
+		return errors.Join(initialDbErr, discoveryErr, ctx.Err())
+	}
+	var regularDiscErr error
+	regularZipMap, regularDiscErr = downloader.DiscoverZipURLs(ctx, cfg.FeedURLs, logger.With(slog.String("feed_type", "regular")))
+	discoveryErr = errors.Join(discoveryErr, regularDiscErr)
+	for url := range regularZipMap {
+		regularZipURLs = append(regularZipURLs, url)
+	}
+	sort.Strings(regularZipURLs)
+	if ctx.Err() != nil {
+		return errors.Join(initialDbErr, discoveryErr, ctx.Err())
+	}
+	discoveryErr = errors.Join(initialDbErr, discoveryErr)
 	if discoveryErr != nil {
-		if len(archiveURLs) == 0 {
-			logger.Error("Archive discovery failed critically or found no URLs. Exiting.", "error", discoveryErr)
+		if len(archiveURLs) == 0 && len(regularZipURLs) == 0 {
+			logger.Error("Discovery failed critically or found no URLs. Exiting.", "error", discoveryErr)
 			return discoveryErr
 		}
-		logger.Warn("Archive discovery completed with non-fatal errors. Proceeding.", "error", discoveryErr)
+		logger.Warn("Discovery completed with non-fatal errors. Proceeding.", "error", discoveryErr)
 	}
-	if ctx.Err() != nil {
-		logger.Warn("Context cancelled after discovery phase.", "error", ctx.Err())
-		return errors.Join(discoveryErr, ctx.Err())
-	}
-	if len(archiveURLs) == 0 {
-		logger.Info("No archive URLs discovered or remaining after initial checks.")
+	if len(archiveURLs) == 0 && len(regularZipURLs) == 0 {
+		logger.Info("No archive or regular zip URLs discovered or remaining.")
 		return discoveryErr
 	}
 
 	// --- Setup Worker Pools and Channels ---
 	var processingErrorsMu sync.Mutex
 	var processingErrors []error
-
-	var extractWg sync.WaitGroup
-	var processWg sync.WaitGroup
-	var writerWg sync.WaitGroup
-	var creatorWg sync.WaitGroup
+	var extractWg, processWg, writerWg, regularDownloadWg sync.WaitGroup
+	// Removed creatorWg
 
 	numExtractWorkers := runtime.NumCPU()
 	numProcessWorkers := runtime.NumCPU()
@@ -102,162 +122,162 @@ func RunCombinedWorkflow(appCtx context.Context, cfg config.Config, dbConnPool *
 	}
 
 	extractJobsChan := make(chan extractionJob, numExtractWorkers*2)
-	processingJobsChan := make(chan processingJob, numProcessWorkers*2)
+	processingJobsChan := make(chan processingJob, numProcessWorkers*2+len(regularZipURLs))
 	writeDataChan := make(chan WriteOperation, numProcessWorkers*10)
-	schemaCreateChan := make(chan SchemaCreateRequest, numProcessWorkers)
+	// Removed schemaCreateChan
+	fatalErrChan := make(chan error, 1) // Channel for workers to report fatal errors
 
 	logger.Info("Initializing workers.",
 		slog.Int("extract_workers", numExtractWorkers),
 		slog.Int("process_workers", numProcessWorkers),
 	)
 
-	// Start DuckDB Writer Goroutine (passing the shared pool)
+	// Start Shared Workers (Writer only)
 	writerWg.Add(1)
-	// Pass dbConnPool (the *sql.DB pool)
 	go runDuckDBWriter(ctx, dbConnPool, logger.With(slog.String("component", "writer")), writeDataChan, &writerWg)
-
-	// Start Schema Creator Goroutine (passing the shared pool)
-	creatorWg.Add(1)
-	// Pass dbConnPool (the *sql.DB pool)
-	go runSchemaCreator(ctx, dbConnPool, logger.With(slog.String("component", "schema_creator")), schemaCreateChan, &creatorWg)
+	// Removed Schema Creator Goroutine start
 
 	// Start Extraction Workers
 	for i := 0; i < numExtractWorkers; i++ {
-		go extractionWorker(ctx, cfg, dbConnPool, logger, &extractWg, &processingErrorsMu, &processingErrors, processingJobsChan, extractJobsChan, i)
+		go extractionWorker(ctx, cfg, dbConnPool, logger, &extractWg, &processingErrorsMu, &processingErrors, processingJobsChan, extractJobsChan, completedZips, forceProcess, i)
 	}
 
-	// Start Processing Workers
+	// Start Processing Workers (Pass fatalErrChan, remove schemaChan)
 	for i := 0; i < numProcessWorkers; i++ {
 		processWg.Add(1)
-		go processingWorker(ctx, cfg, dbConnPool, logger, &processWg, &processingErrorsMu, &processingErrors, schemaCreateChan, writeDataChan, processingJobsChan, i)
+		go processingWorker(ctx, cfg, dbConnPool, logger, &processWg, &processingErrorsMu, &processingErrors /* Removed schemaChan */, writeDataChan, processingJobsChan, fatalErrChan, i)
 	}
 
-	// --- Phase 2: Download Outer Archives and Dispatch Extraction Jobs ---
-	logger.Info("Starting sequential download and dispatching extraction jobs.", slog.Int("url_count", len(archiveURLs)))
-
-	totalDownloadAttempts := 0
-	totalSkippedCount := 0
-	totalDownloadErrors := 0
-	totalExtractionDispatched := 0
-
-	// Download Loop
-	for i, url := range archiveURLs {
-		logEntry := logger.With(slog.String("archive_url", url), slog.Int("index", i+1), slog.Int("total_urls", len(archiveURLs)))
-
+	// --- Goroutine to listen for fatal errors and trigger shutdown ---
+	var fatalError error // Variable to store the fatal error
+	shutdownWg := sync.WaitGroup{}
+	shutdownWg.Add(1)
+	go func() {
+		defer shutdownWg.Done()
 		select {
+		case err, ok := <-fatalErrChan:
+			// Check 'ok' in case channel was closed before error sent
+			if ok && err != nil {
+				logger.Error("Fatal error received from worker, initiating shutdown.", "error", err)
+				fatalError = err // Store the error
+				stopFunc()       // Trigger context cancellation
+			} else {
+				logger.Debug("Fatal error listener exiting: channel closed.")
+			}
 		case <-ctx.Done():
-			logEntry.Warn("Orchestration cancelled during download loop.", "error", ctx.Err())
-			goto cleanup
-		default:
+			// Context cancelled normally or by signal, just exit listener
+			logger.Debug("Fatal error listener exiting: context cancelled.")
 		}
+	}()
 
-		// Skip Check
-		if completed, found := completedOuterArchives[url]; found && completed && !forceProcess && !forceDownload {
-			logEntry.Info("Skipping outer archive, already marked as completed in DB.")
-			totalSkippedCount++
-			continue
-		}
+	// --- Phase 2a: Run Archive Downloads ---
+	totalExtractionDispatched, archiveDownloadErrors, archiveSkippedCount := downloadArchivesAndDispatch(
+		ctx, cfg, dbConnPool, logger, client, archiveURLs, completedOuterArchives,
+		extractJobsChan, &extractWg, &processingErrorsMu, &processingErrors,
+		forceDownload, forceProcess,
+	)
 
-		// Download
-		totalDownloadAttempts++
-		logEntry.Info("Attempting download.")
-		archiveData, downloadErr := DownloadArchive(ctx, cfg, dbConnPool, logEntry, client, url)
+	// --- Phase 2b: Run Regular Zip Downloads (in parallel goroutine) ---
+	regularDownloadWg.Add(1)
+	var totalProcessingDispatched, regularDownloadErrors, regularSkippedCount int
+	go func() {
+		totalProcessingDispatched, regularDownloadErrors, regularSkippedCount = downloadRegularZipsAndDispatch(
+			ctx, cfg, dbConnPool, logger, client, regularZipURLs, regularZipMap,
+			completedZips, processingJobsChan, &regularDownloadWg,
+			&processingErrorsMu, &processingErrors, forceProcess,
+		)
+	}()
 
-		if downloadErr != nil {
-			processingErrorsMu.Lock()
-			processingErrors = append(processingErrors, fmt.Errorf("download %s: %w", url, downloadErr))
-			processingErrorsMu.Unlock()
-			totalDownloadErrors++
-			continue
-		}
-
-		// Dispatch Extraction Job
-		logEntry.Info("Download successful, dispatching job to extraction workers.")
-		totalExtractionDispatched++
-		extractWg.Add(1)
-		select {
-		case extractJobsChan <- extractionJob{archiveURL: url, data: archiveData, logEntry: logEntry}:
-			// Job sent
-		case <-ctx.Done():
-			logEntry.Warn("Context cancelled while dispatching extraction job.", "error", ctx.Err())
-			extractWg.Done()
-			goto cleanup
-		}
-	} // End download loop
-
-cleanup:
 	// --- Shutdown Sequence ---
-	logger.Info("Download loop finished. Closing extraction job channel.")
-	close(extractJobsChan)
-
-	logger.Info("Waiting for extraction workers to finish...")
+	logger.Info("Waiting for downloads and extraction dispatch to complete...")
 	extractWg.Wait()
-	logger.Info("Extraction workers finished. Closing processing job channel.")
-	close(processingJobsChan)
+	logger.Debug("Extraction workers finished dispatching.")
+	regularDownloadWg.Wait()
+	logger.Debug("Regular downloads finished dispatching.")
+	logger.Info("All dispatching complete. Closing processing job channel.")
+	close(processingJobsChan) // Close channel *after* all producers are done
+
+	// Wait for the fatal error listener goroutine to exit.
+	// Close the fatalErrChan *after* closing processingJobsChan and waiting for processWg
+	// to ensure any potential late fatal error from a processor is caught.
+	// However, closing it earlier allows shutdownWg.Wait() to proceed sooner if no error occurred.
+	// Let's close it after waiting for processors.
 
 	logger.Info("Waiting for processing workers to finish...")
 	processWg.Wait()
-	logger.Info("Processing workers finished. Closing data write channel.")
-	close(writeDataChan)
+	logger.Info("Processing workers finished. Closing fatal error channel.")
+	close(fatalErrChan) // Now safe to close fatal chan
+	shutdownWg.Wait()   // Wait for listener to exit
+	logger.Debug("Fatal error listener goroutine finished.")
+
+	logger.Info("Closing data write channel.")
+	close(writeDataChan) // Close write channel after processors are done
 
 	logger.Info("Waiting for DuckDB writer to finish...")
 	writerWg.Wait()
-	logger.Info("DuckDB writer finished. Closing schema create channel.")
-	close(schemaCreateChan)
-
-	logger.Info("Waiting for Schema creator to finish...")
-	creatorWg.Wait()
-	logger.Info("Schema creator finished.")
+	logger.Info("DuckDB writer finished.")
+	// Removed waiting for creatorWg
 
 	// --- Final Summary ---
 	processingErrorsMu.Lock()
 	numProcessingErrors := len(processingErrors)
 	finalError := errors.Join(processingErrors...)
 	processingErrorsMu.Unlock()
-
 	if discoveryErr != nil {
 		finalError = errors.Join(discoveryErr, finalError)
 	}
-	if ctx.Err() != nil && !errors.Is(finalError, ctx.Err()) {
+	// Prioritize fatal error if it occurred
+	if fatalError != nil {
+		finalError = errors.Join(fatalError, finalError)
+	} else if ctx.Err() != nil && !errors.Is(finalError, ctx.Err()) {
 		finalError = errors.Join(finalError, ctx.Err())
 	}
 
 	logger.Info("Orchestration finished.",
-		slog.Int("urls_discovered", len(archiveURLs)),
-		slog.Int("urls_skipped_db", totalSkippedCount),
-		slog.Int("download_attempts", totalDownloadAttempts),
-		slog.Int("download_errors", totalDownloadErrors),
-		slog.Int("extractions_dispatched", totalExtractionDispatched),
+		slog.Int("archive_urls_discovered", len(archiveURLs)), slog.Int("regular_urls_discovered", len(regularZipURLs)),
+		slog.Int("archives_skipped_db", archiveSkippedCount), slog.Int("regular_zips_skipped_db", regularSkippedCount),
+		slog.Int("archive_download_errors", archiveDownloadErrors), slog.Int("regular_download_errors", regularDownloadErrors),
+		slog.Int("extractions_dispatched", totalExtractionDispatched), slog.Int("processing_jobs_dispatched", totalProcessingDispatched),
 		slog.Int("total_processing_errors", numProcessingErrors),
 	)
 
 	if finalError != nil {
-		// Final error check (same as before)
-		isCancellation := errors.Is(finalError, context.Canceled) || errors.Is(finalError, context.DeadlineExceeded)
-		containsOtherErrors := false
-		if !isCancellation {
-			containsOtherErrors = true
+		if errors.Is(finalError, ErrSchemaValidationFailed) {
+			logger.Error("Workflow stopped due to fatal schema validation error.", "error", finalError)
 		} else {
-			unwrapped := errors.Unwrap(finalError)
-			if unwrapped != nil && !errors.Is(unwrapped, context.Canceled) && !errors.Is(unwrapped, context.DeadlineExceeded) {
-				if finalError.Error() != unwrapped.Error() {
-					containsOtherErrors = true
+			isCancellation := errors.Is(finalError, context.Canceled) || errors.Is(finalError, context.DeadlineExceeded)
+			containsOtherErrors := false
+			if !isCancellation {
+				containsOtherErrors = true
+			} else {
+				var tempErrs []error
+				if jErr, ok := finalError.(interface{ Unwrap() []error }); ok {
+					tempErrs = jErr.Unwrap()
+				} else {
+					unwrapped := errors.Unwrap(finalError)
+					if unwrapped != nil {
+						tempErrs = []error{unwrapped}
+					}
 				}
-			}
-			processingErrorsMu.Lock() // Lock needed if accessing processingErrors slice
-			if len(processingErrors) > 0 && isCancellation {
-				// Check if the only error IS the cancellation error added at the end
-				if !(len(processingErrors) == 1 && errors.Is(processingErrors[0], ctx.Err())) {
-					containsOtherErrors = true
+				for _, e := range tempErrs {
+					if !errors.Is(e, context.Canceled) && !errors.Is(e, context.DeadlineExceeded) {
+						containsOtherErrors = true
+						break
+					}
 				}
+				processingErrorsMu.Lock()
+				if len(processingErrors) > 0 && isCancellation && !containsOtherErrors {
+					if !(len(processingErrors) == 1 && errors.Is(processingErrors[0], ctx.Err())) {
+						containsOtherErrors = true
+					}
+				}
+				processingErrorsMu.Unlock()
 			}
-			processingErrorsMu.Unlock()
-		}
-
-		if isCancellation && !containsOtherErrors {
-			logger.Warn("Workflow cancelled.", "error", finalError)
-		} else {
-			logger.Error("Workflow completed with errors.", "error", finalError)
+			if isCancellation && !containsOtherErrors {
+				logger.Warn("Workflow cancelled.", "error", finalError)
+			} else {
+				logger.Error("Workflow completed with errors.", "error", finalError)
+			}
 		}
 		return finalError
 	}
@@ -266,121 +286,125 @@ cleanup:
 	return nil
 }
 
-// extractionWorker (Modified): Listens for extraction jobs, performs extraction,
-// and sends the *path* of the extracted inner zip to the processingJobsChan.
+// extractionWorker (No changes needed)
 func extractionWorker(
-	ctx context.Context,
-	cfg config.Config,
-	dbConnPool *sql.DB, // Used for logging within ExtractInnerZips
-	baseLogger *slog.Logger,
-	wg *sync.WaitGroup,
-	mu *sync.Mutex, // Mutex for shared error slice
-	processingErrors *[]error, // Pointer to the shared error slice
-	processingJobsChan chan<- processingJob, // Channel to send paths for processing
-	jobs <-chan extractionJob, // Channel to receive extraction jobs
-	workerID int,
+	ctx context.Context, cfg config.Config, dbConnPool *sql.DB, baseLogger *slog.Logger, wg *sync.WaitGroup, mu *sync.Mutex, processingErrors *[]error, processingJobsChan chan<- processingJob, jobs <-chan extractionJob, completedZips map[string]bool, forceProcess bool, workerID int,
 ) {
 	logger := baseLogger.With(slog.Int("worker_id", workerID), slog.String("component", "extractor"))
 	logger.Info("Extraction worker started.")
-
 	for job := range jobs {
 		select {
 		case <-ctx.Done():
 			logger.Warn("Context cancelled before starting extraction job.", "archive_url", job.archiveURL, "error", ctx.Err())
-			wg.Done() // Must call Done as wg.Add happened before send
+			wg.Done()
 			continue
 		default:
 		}
-
 		workerLog := job.logEntry.With(slog.Int("worker_id", workerID), slog.String("component", "extractor"))
 		workerLog.Info("Processing extraction job.")
-
-		// Perform the extraction
 		extractedPaths, extractErr := ExtractInnerZips(ctx, cfg, dbConnPool, workerLog, job.archiveURL, job.data)
-
 		if extractErr != nil {
 			mu.Lock()
 			*processingErrors = append(*processingErrors, fmt.Errorf("extract %s: %w", job.archiveURL, extractErr))
 			mu.Unlock()
-			// Don't dispatch failed extractions for processing
 		} else {
 			workerLog.Info("Extraction successful, dispatching inner zips for processing.", slog.Int("count", len(extractedPaths)))
-			// Dispatch each successfully extracted file path for processing
-		dispatchLoop: // Label needed for breaking out of inner loop on context cancellation
+		dispatchLoop:
 			for _, path := range extractedPaths {
-				procJob := processingJob{
-					zipFilePath: path,
-					logEntry:    workerLog.With(slog.String("inner_zip_path", filepath.Base(path))), // Add inner zip context
+				innerZipName := filepath.Base(path)
+				if completed, found := completedZips[innerZipName]; found && completed && !forceProcess {
+					workerLog.Info("Skipping processing for inner zip, already completed.", "inner_zip", innerZipName)
+					continue
 				}
+				procJob := processingJob{zipFilePath: path, logEntry: workerLog.With(slog.String("inner_zip_path", innerZipName))}
 				select {
 				case processingJobsChan <- procJob:
-					// Sent processing job
 				case <-ctx.Done():
 					workerLog.Warn("Context cancelled while dispatching processing job.", "path", path, "error", ctx.Err())
-					// No need to add error here, main loop/final check handles ctx.Err()
-					// Need to break out of this inner loop if cancelled
-					break dispatchLoop // Break out of the path dispatching loop for this job
+					break dispatchLoop
 				}
 			}
-			// Removed endExtractionJob label as break dispatchLoop achieves the same
 		}
-
-		// Decrement WaitGroup *after* processing (and dispatching) is complete for this *extraction* job
 		wg.Done()
-	} // End range jobs
-
+	}
 	logger.Info("Extraction worker finished (jobs channel closed).")
 }
 
-// processingWorker listens on the processingJobsChan and processes individual zip files.
+// processingWorker (Modified): Removed schemaChan parameter.
 func processingWorker(
 	ctx context.Context,
 	cfg config.Config,
-	dbConnPool *sql.DB, // Used for logging within processZip
+	dbConnPool *sql.DB,
 	baseLogger *slog.Logger,
 	wg *sync.WaitGroup,
-	mu *sync.Mutex, // Mutex for shared error slice
-	processingErrors *[]error, // Pointer to the shared error slice
-	schemaChan chan<- SchemaCreateRequest, // Channel for schema creation
-	writeChan chan<- WriteOperation, // Channel for data writing
-	jobs <-chan processingJob, // Channel to receive jobs
+	mu *sync.Mutex,
+	processingErrors *[]error,
+	// Removed schemaChan chan<- SchemaCreateRequest,
+	writeChan chan<- WriteOperation,
+	jobs <-chan processingJob,
+	fatalErrChan chan<- error,
 	workerID int,
 ) {
-	defer wg.Done() // Decrement WaitGroup when worker exits
+	defer wg.Done()
 	logger := baseLogger.With(slog.Int("worker_id", workerID), slog.String("component", "processor"))
 	logger.Info("Processing worker started.")
 
 	for job := range jobs {
+		// Check context *before* starting job processing
+		// This prevents starting a job if shutdown has already been triggered
 		select {
 		case <-ctx.Done():
 			logger.Warn("Context cancelled before starting processing job.", "zip_file", job.zipFilePath, "error", ctx.Err())
-			// Don't add error, final check handles ctx.Err()
-			continue // Continue to drain channel? Or return? Let's continue.
+			continue // Skip job if context already cancelled
 		default:
 		}
 
-		// Use the logger passed with the job if available, otherwise fallback
 		workerLog := job.logEntry
 		if workerLog == nil {
 			workerLog = logger.With(slog.String("zip_file", filepath.Base(job.zipFilePath)))
 		} else {
-			workerLog = workerLog.With(slog.Int("worker_id", workerID), slog.String("component", "processor")) // Add worker context
+			workerLog = workerLog.With(slog.Int("worker_id", workerID), slog.String("component", "processor"))
 		}
 
 		workerLog.Info("Processing zip file job.")
 
-		// Call the main processing function for the zip file
-		// Pass dbConnPool for logging purposes inside processZip
-		err := processZip(ctx, cfg, dbConnPool, workerLog, job.zipFilePath, schemaChan, writeChan)
+		// Call processZip without schemaChan
+		err := processZip(ctx, cfg, dbConnPool, workerLog, job.zipFilePath /* Removed schemaChan */, writeChan)
 
 		if err != nil {
-			// Log error already happens inside processZip
-			mu.Lock()
-			*processingErrors = append(*processingErrors, fmt.Errorf("process %s: %w", job.zipFilePath, err))
-			mu.Unlock()
+			// Check if it's the fatal schema error
+			if errors.Is(err, ErrSchemaValidationFailed) {
+				workerLog.Error("Fatal schema validation error encountered.", "zip_file", job.zipFilePath, "error", err)
+				// Send non-blocking to fatal channel
+				select {
+				case fatalErrChan <- err:
+					logger.Info("Sent fatal error notification.")
+				default:
+					// If channel is full or closed, log but don't block worker
+					logger.Warn("Fatal error channel full or closed, unable to send notification.")
+				}
+				// Add fatal error to regular errors as well for final summary
+				mu.Lock()
+				*processingErrors = append(*processingErrors, fmt.Errorf("process %s: %w", job.zipFilePath, err))
+				mu.Unlock()
+				// Worker will exit naturally on next loop iteration due to context cancellation triggered by the listener
+			} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				// Log and collect non-fatal, non-cancellation errors
+				mu.Lock()
+				*processingErrors = append(*processingErrors, fmt.Errorf("process %s: %w", job.zipFilePath, err))
+				mu.Unlock()
+			}
+			// Cancellation errors are handled by the main orchestrator's final check
 		}
-		// No wg.Done() here, it's handled by the defer at the start
 	} // End range jobs
 
 	logger.Info("Processing worker finished (jobs channel closed).")
 }
+
+// --- Ensure helper functions are defined (or imported) ---
+// DiscoverArchiveURLs(...)
+// DownloadArchive(...)
+// ExtractInnerZips(...)
+// runDuckDBWriter(...)
+// processZip(...) - defined in processor.go
+// CreateAllPredefinedSchemas(...) - defined in schema_preload.go

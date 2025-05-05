@@ -30,3 +30,4 @@ output_parquet/
 *.zip
 *.duckdb.wal
 *.duckdb
+*.bak

@@ -1,0 +1,1358 @@
+{
+    "FPP__CONSTRAINT_FREQ_MEASURE__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "MEASUREMENT_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "FM_RAISE_HZ",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "FM_LOWER_HZ",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USED_IN_RCR_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "CORRELATION_FLAG",
+                "type": "BIGINT"
+            }
+        ]
+    },
+    "FPP__EST_PERF_COST_RATE__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RELEVANT_REGIONS",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "FPP_PAYMENT_RATE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "FPP_RECOVERY_RATE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USED_FCAS_RATE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "UNUSED_FCAS_RATE",
+                "type": "DOUBLE"
+            }
+        ]
+    },
+    "FPP__EST_RESIDUAL_COST_RATE__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RELEVANT_REGIONS",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "FPP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USED_FCAS",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "UNUSED_FCAS",
+                "type": "DOUBLE"
+            }
+        ]
+    },
+    "FPP__FCAS_SUMMARY__1": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "RUNNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RELEVANT_REGIONS",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "REGULATION_MW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "CONSTRAINT_MARGINAL_VALUE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "P_REGULATION",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "BASE_COST",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TSFCAS",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TOTAL_FPP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RCR",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USAGE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USAGE_VALUE",
+                "type": "DOUBLE"
+            }
+        ]
+    },
+    "FPP__FORECAST_DEFAULT_CF__1": {
+        "columns": [
+            {
+                "name": "FPP_UNITID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "EFFECTIVE_START_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "EFFECTIVE_END_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "REGIONID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "DEFAULT_CONTRIBUTION_FACTOR",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "DCF_REASON_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "DCF_ABS_NEGATIVE_PERF_TOTAL",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SETTLEMENTS_UNITID",
+                "type": "VARCHAR"
+            }
+        ]
+    },
+    "FPP__FORECAST_RESIDUAL_DCF__1": {
+        "columns": [
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "EFFECTIVE_START_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "EFFECTIVE_END_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RESIDUAL_DCF",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RESIDUAL_DCF_REASON_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "DCF_ABS_NEGATIVE_PERF_TOTAL",
+                "type": "DOUBLE"
+            }
+        ]
+    },
+    "FPP__FPP_RCR__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RCR",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RCR_REASON_FLAG",
+                "type": "BIGINT"
+            }
+        ]
+    },
+    "FPP__FPP_RUN__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "FPPRUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "RUN_STATUS",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "AUTHORISED_DATETIME",
+                "type": "TIMESTAMP_MS"
+            }
+        ]
+    },
+    "FPP__FPP_USAGE__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "REGULATION_MW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USED_MW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USAGE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "USAGE_REASON_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "USAGE_VALUE",
+                "type": "DOUBLE"
+            }
+        ]
+    },
+    "FPP__HIST_PERFORMANCE__1": {
+        "columns": [
+            {
+                "name": "FPP_UNITID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "EFFECTIVE_START_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "EFFECTIVE_END_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "HIST_PERIOD_START_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "HIST_PERIOD_END_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "REG_HIST_RAISE_PERFORMANCE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "REG_HIST_LOWER_PERFORMANCE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "FPP_HIST_RAISE_PERFORMANCE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "FPP_HIST_LOWER_PERFORMANCE",
+                "type": "DOUBLE"
+            }
+        ]
+    },
+    "FPP__REGION_FREQ_MEASURE__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "MEASUREMENT_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "REGIONID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "FREQ_DEVIATION_HZ",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "HZ_QUALITY_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "FREQ_MEASURE_HZ",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "FM_ALIGNMENT_FLAG",
+                "type": "BIGINT"
+            }
+        ]
+    },
+    "FPP__RESIDUAL_CF__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BIDTYPE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RESIDUAL_CF",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "NEGATIVE_RESIDUAL_CF",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RESIDUAL_DCF",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RESIDUAL_CF_REASON_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "CF_ABS_POSITIVE_PERF_TOTAL",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "CF_ABS_NEGATIVE_PERF_TOTAL",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "NCF_ABS_NEGATIVE_PERF_TOTAL",
+                "type": "DOUBLE"
+            }
+        ]
+    },
+    "FPP__RESIDUAL_PERFORMANCE__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "REGIONID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "RAISE_PERFORMANCE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE_REASON_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOWER_PERFORMANCE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER_REASON_FLAG",
+                "type": "BIGINT"
+            }
+        ]
+    },
+    "FPP__UNIT_MW__1": {
+        "columns": [
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "MEASUREMENT_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "FPP_UNITID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "MEASURED_MW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "MW_QUALITY_FLAG",
+                "type": "BIGINT"
+            },
+            {
+                "name": "SCHEDULED_MW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "DEVIATION_MW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "PARTICIPANTID",
+                "type": "VARCHAR"
+            }
+        ]
+    },
+    "P5MIN__CASESOLUTION__2": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "STARTINTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "INTERVENTION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALOBJECTIVE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "NONPHYSICALLOSSES",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALAREAGENVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALINTERCONNECTORVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALGENERICVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALRAMPRATEVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALUNITMWCAPACITYVIOLATION",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TOTAL5MINVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "TOTALREGVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "TOTAL6SECVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "TOTAL60SECVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "TOTALENERGYCONSTRVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALENERGYOFFERVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALASPROFILEVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "TOTALFASTSTARTVIOLATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LASTCHANGED",
+                "type": "TIMESTAMP_MS"
+            }
+        ]
+    },
+    "P5MIN__CONSTRAINTSOLUTION__6": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "INTERVENTION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RHS",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "MARGINALVALUE",
+                "type": "BIGINT"
+            },
+            {
+                "name": "VIOLATIONDEGREE",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LASTCHANGED",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "DUID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "GENCONID_EFFECTIVEDATE",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "GENCONID_VERSIONNO",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LHS",
+                "type": "BIGINT"
+            }
+        ]
+    },
+    "P5MIN__INTERCONNECTORSOLN__4": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "INTERVENTION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "INTERCONNECTORID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "METEREDMWFLOW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "MWFLOW",
+                "type": "BIGINT"
+            },
+            {
+                "name": "MWLOSSES",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "MARGINALVALUE",
+                "type": "BIGINT"
+            },
+            {
+                "name": "VIOLATIONDEGREE",
+                "type": "BIGINT"
+            },
+            {
+                "name": "MNSP",
+                "type": "BIGINT"
+            },
+            {
+                "name": "EXPORTLIMIT",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "IMPORTLIMIT",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "MARGINALLOSS",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "EXPORTGENCONID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "IMPORTGENCONID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "FCASEXPORTLIMIT",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "FCASIMPORTLIMIT",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LASTCHANGED",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "LOCAL_PRICE_ADJUSTMENT_EXPORT",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOCALLY_CONSTRAINED_EXPORT",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOCAL_PRICE_ADJUSTMENT_IMPORT",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOCALLY_CONSTRAINED_IMPORT",
+                "type": "BIGINT"
+            }
+        ]
+    },
+    "P5MIN__LOCAL_PRICE__1": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "DUID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "LOCAL_PRICE_ADJUSTMENT",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOCALLY_CONSTRAINED",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LASTCHANGED",
+                "type": "TIMESTAMP_MS"
+            }
+        ]
+    },
+    "P5MIN__REGIONSOLUTION__9": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "INTERVENTION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "REGIONID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "ROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "EXCESSGENERATION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "RAISE6SECRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE6SECROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE60SECRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE60SECROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE5MINRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE5MINROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISEREGRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISEREGROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER6SECRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER6SECROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER60SECRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER60SECROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER5MINRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER5MINROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWERREGRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWERREGROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TOTALDEMAND",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "AVAILABLEGENERATION",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "AVAILABLELOAD",
+                "type": "BIGINT"
+            },
+            {
+                "name": "DEMANDFORECAST",
+                "type": "BIGINT"
+            },
+            {
+                "name": "DISPATCHABLEGENERATION",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "DISPATCHABLELOAD",
+                "type": "BIGINT"
+            },
+            {
+                "name": "NETINTERCHANGE",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER5MINDISPATCH",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER5MINIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER5MINLOCALDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOWER5MINLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER5MINREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER60SECDISPATCH",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER60SECIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER60SECLOCALDISPATCH",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER60SECLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER60SECREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER6SECDISPATCH",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER6SECIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER6SECLOCALDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOWER6SECLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER6SECREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE5MINDISPATCH",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE5MINIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE5MINLOCALDISPATCH",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE5MINLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE5MINREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE60SECDISPATCH",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE60SECIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE60SECLOCALDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "RAISE60SECLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE60SECREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE6SECDISPATCH",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE6SECIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE6SECLOCALDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "RAISE6SECLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE6SECREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "AGGREGATEDISPATCHERROR",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "INITIALSUPPLY",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "CLEAREDSUPPLY",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWERREGIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWERREGDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOWERREGLOCALDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LOWERREGLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWERREGREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISEREGIMPORT",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISEREGDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "RAISEREGLOCALDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "RAISEREGLOCALREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISEREGREQ",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE5MINLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISEREGLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE60SECLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE6SECLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER5MINLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWERREGLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER60SECLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER6SECLOCALVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE5MINVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISEREGVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE60SECVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RAISE6SECVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER5MINVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWERREGVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER60SECVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LOWER6SECVIOLATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "LASTCHANGED",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "TOTALINTERMITTENTGENERATION",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "DEMAND_AND_NONSCHEDGEN",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "UIGF",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SEMISCHEDULE_CLEAREDMW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SEMISCHEDULE_COMPLIANCEMW",
+                "type": "BIGINT"
+            },
+            {
+                "name": "SS_SOLAR_UIGF",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SS_WIND_UIGF",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SS_SOLAR_CLEAREDMW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SS_WIND_CLEAREDMW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SS_SOLAR_COMPLIANCEMW",
+                "type": "BIGINT"
+            },
+            {
+                "name": "SS_WIND_COMPLIANCEMW",
+                "type": "BIGINT"
+            },
+            {
+                "name": "WDR_INITIALMW",
+                "type": "BIGINT"
+            },
+            {
+                "name": "WDR_AVAILABLE",
+                "type": "BIGINT"
+            },
+            {
+                "name": "WDR_DISPATCHED",
+                "type": "BIGINT"
+            },
+            {
+                "name": "SS_SOLAR_AVAILABILITY",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SS_WIND_AVAILABILITY",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE1SECRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE1SECROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER1SECRRP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER1SECROP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "RAISE1SECLOCALDISPATCH",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "LOWER1SECLOCALDISPATCH",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BDU_ENERGY_STORAGE",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "BDU_MIN_AVAIL",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BDU_MAX_AVAIL",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BDU_CLEAREDMW_GEN",
+                "type": "BIGINT"
+            },
+            {
+                "name": "BDU_CLEAREDMW_LOAD",
+                "type": "BIGINT"
+            }
+        ]
+    },
+    "PD7DAY__CASESOLUTION__1": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "INTERVENTION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LASTCHANGED",
+                "type": "TIMESTAMP_MS"
+            }
+        ]
+    },
+    "PD7DAY__CONSTRAINTSOLUTION__1": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "INTERVENTION",
+                "type": "BIGINT"
+            },
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "CONSTRAINTID",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "RHS",
+                "type": "BIGINT"
+            },
+            {
+                "name": "MARGINALVALUE",
+                "type": "BIGINT"
+            },
+            {
+                "name": "VIOLATIONDEGREE",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LHS",
+                "type": "BIGINT"
+            },
+            {
+                "name": "LASTCHANGED",
+                "type": "TIMESTAMP_MS"
+            }
+        ]
+    },
+    "PD7DAY__MARKET_SUMMARY__2": {
+        "columns": [
+            {
+                "name": "RUN_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "INTERVAL_DATETIME",
+                "type": "TIMESTAMP_MS"
+            },
+            {
+                "name": "GPG_FUEL_FORECAST_TJ",
+                "type": "DOUBLE"
+            }
+        ]
+    }
+}
